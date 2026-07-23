@@ -29,6 +29,7 @@ set(NSPARSE_TEST_SRC
     seismic_scalar_quantized_index_test.cpp
     sparse_vectors_test.cpp
     vector_process_test.cpp
+    visited_set_test.cpp
 )
 
 # Fetch GoogleTest
