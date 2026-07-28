@@ -11,6 +11,7 @@
 #define NSPARSE_VISITED_SET_H
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
