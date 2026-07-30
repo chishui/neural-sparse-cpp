@@ -80,28 +80,21 @@ void query_single_inverted_list(const SparseVectors* vectors,
         }
         const auto& docs = cluster_invlist.get_docs(cluster_id);
         const size_t n_docs = docs.size();
-        // Two-stage prefetch pipeline:
-        // Stage 1 (distance 2): prefetch indptr[docs[i+2]] so the indptr
-        //   lookup is cached by the time we need it next iteration.
-        // Stage 2 (distance 1): read indptr[docs[i+1]] (now cached from
-        //   stage 1 issued last iteration), prefetch the actual vector data.
-        static constexpr size_t kPrefetchDist1 = 2;  // vector data prefetch
-        static constexpr size_t kPrefetchDist2 = 4;  // indptr prefetch
+        // Prefetch one doc ahead, only the leading lines of the upcoming row;
+        // the row is contiguous so the hardware streamer pulls the tail, while
+        // bounding outstanding software prefetches keeps the line-fill buffers
+        // from saturating (measured optimum ~4 lines).
+        static constexpr size_t kPrefetchDist = 1;
+        static constexpr size_t kPrefetchHeadLines = 4;
         for (size_t i = 0; i < n_docs; ++i) {
             const auto& doc_id = docs[i];
-            // Stage 1: prefetch indptr entry for doc at distance 2
-            if (i + kPrefetchDist2 < n_docs) {
-                detail::prefetch_indptr(indptr, docs[i + kPrefetchDist2]);
-            }
-            // Stage 2: prefetch vector data for next doc (indptr should
-            // already be cached from stage 1 issued kPrefetchDist2 -
-            // kPrefetchDist1 iterations ago)
-            if (i + kPrefetchDist1 < n_docs) {
-                const idx_t next_doc = docs[i + kPrefetchDist1];
+            if (i + kPrefetchDist < n_docs) {
+                const idx_t next_doc = docs[i + kPrefetchDist];
                 const idx_t next_start = indptr[next_doc];
                 const size_t next_len = indptr[next_doc + 1] - next_start;
-                detail::prefetch_vector(indices + next_start,
-                                        values + next_start, next_len);
+                detail::prefetch_vector_head(indices + next_start,
+                                             values + next_start, next_len,
+                                             kPrefetchHeadLines);
             }
             auto [_, inserted] = visited.insert(doc_id);
             if (!inserted) {
