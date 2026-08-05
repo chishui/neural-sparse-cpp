@@ -9,159 +9,155 @@
 
 #include "nsparse/cluster/kmeans_utils.h"
 
+#include <algorithm>
 #include <cstdint>
-#include <cstring>
-#include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
-#include "nsparse/utils/distance_simd.h"
 #ifdef NSPARSE_WITH_GPU
 #include "nsparse/gpu/gpu_cluster_assigner.h"
 #include "nsparse/gpu/gpu_diagnostics.h"
 #endif
-#if defined(__AVX512F__)
-#include <memory>
-#include <type_traits>
-
-#include "nsparse/utils/dense_vector_matrix.h"
-#endif
 
 namespace nsparse::detail {
-#if defined(__AVX512F__)
+namespace {
 
-template <typename T>
-static std::unique_ptr<DenseVectorMatrixT<T>>
-initialize_cluster_representatives(
-    const std::vector<std::vector<T>>& dense_centroids,
-    size_t center_dimension) {
-    size_t cluster_count = dense_centroids.size();
-    auto representatives = std::make_unique<DenseVectorMatrixT<T>>(
-        center_dimension,  // Number of dimensions
-        cluster_count      // Number of clusters
-    );
+// Cluster index within one posting list's clustering. Independent of
+// InvertedListClusters::cluster_id_t (the narrower on-disk type): clusters here
+// can be as many as the documents being clustered.
+using local_cluster_id_t = uint32_t;
 
-    // Fill the representatives matrix
-    T* data = representatives->data();
-    for (size_t dim = 0; dim < center_dimension; ++dim) {
-        for (size_t cluster_idx = 0; cluster_idx < cluster_count;
-             ++cluster_idx) {
-            data[dim * cluster_count + cluster_idx] =
-                dense_centroids[cluster_idx][dim];
-        }
-    }
+// Similarity accumulator: exact for quantized weights, whose products can exceed
+// float's 24-bit mantissa (65535^2 alone is ~4.3e9), and float for float weights.
+template <class T>
+using accumulator_t = std::conditional_t<std::is_same_v<T, float>, float, int64_t>;
 
-    return representatives;
-}
+// Term-major (CSC) index over the cluster centroids: for each term, the list of
+// clusters whose centroid contains it, with the centroid's weight.
+template <class T>
+struct CentroidIndex {
+    std::vector<idx_t> term_ptr;              // size n_cols + 1
+    std::vector<local_cluster_id_t> cluster;  // size = total centroid postings
+    std::vector<T> weight;                    // parallel to cluster
+    size_t n_cols = 0;                        // terms [0, n_cols) are indexed
+};
 
-template <typename T>
-static std::vector<std::vector<T>> centroids_to_dense(
-    const std::vector<std::vector<idx_t>>& clusters,
-    const SparseVectors* vectors) {
-    std::vector<std::vector<T>> dense_centroids;
-    dense_centroids.reserve(clusters.size());
-    for (const auto& cluster : clusters) {
-        if constexpr (std::is_same_v<T, float>) {
-            const auto& dense = vectors->get_dense_vector_float(cluster.at(0));
-            dense_centroids.emplace_back(dense);
-        } else {
-            const auto& raw_dense = vectors->get_dense_vector(cluster.at(0));
-            std::vector<T> typed_dense(raw_dense.size() / sizeof(T));
-            std::memcpy(typed_dense.data(), raw_dense.data(), raw_dense.size());
-            dense_centroids.emplace_back(std::move(typed_dense));
-        }
-    }
-    return dense_centroids;
-}
-
-template <typename T>
-static size_t get_dense_vector_max_dimension(
-    const std::vector<std::vector<T>>& dense) {
-    size_t max_dimension = 0;
-    for (const auto& centroid : dense) {
-        max_dimension = std::max<size_t>(max_dimension, centroid.size());
-    }
-    return max_dimension;
-}
-
-// Unified template for map_docs_to_clusters_avx512
-template <typename T>
-static void map_docs_to_clusters_avx512_impl(
-    const SparseVectors* vectors, const std::vector<idx_t>& docs,
-    std::vector<std::vector<idx_t>>& clusters) {
-    size_t n_clusters = clusters.size();
-    size_t n_docs = docs.size();
-
-    auto dense_centroids = centroids_to_dense<T>(clusters, vectors);
-    size_t max_dimension = vectors->get_dimension() == 0
-                               ? get_dense_vector_max_dimension(dense_centroids)
-                               : vectors->get_dimension();
-    size_t center_dimension = (n_clusters > 0) ? max_dimension : 0;
-    auto cluster_representatives =
-        initialize_cluster_representatives(dense_centroids, center_dimension);
-    dense_centroids = std::vector<std::vector<T>>();
-
+// Build the CSC over centroids only. Centroids are sparse (one document each),
+// so this is proportional to their combined non-zeros — not to
+// dimension x n_clusters.
+template <class T>
+CentroidIndex<T> build_centroid_index(
+    const SparseVectors* vectors,
+    const std::vector<std::vector<idx_t>>& clusters) {
     const idx_t* indptr = vectors->indptr_data();
     const term_t* indices = vectors->indices_data();
-    const T* values = reinterpret_cast<const T*>(vectors->values_data());
+    const T* values = vectors->typed_values_data<T>();
+    const size_t n_clusters = clusters.size();
 
-    for (size_t i = 0; i < n_docs; ++i) {
-        idx_t doc_id = docs[i];
-        const idx_t start = indptr[doc_id];
-        const size_t len = indptr[doc_id + 1] - start;
+    // Column count comes from the centroids' own terms rather than the
+    // configured dimension, which callers may leave at 0 (unset).
+    size_t max_term = 0;
+    size_t nnz = 0;
+    for (const auto& cluster : clusters) {
+        const idx_t centroid = cluster.at(0);
+        for (idx_t j = indptr[centroid]; j < indptr[centroid + 1]; ++j) {
+            max_term = std::max<size_t>(max_term, indices[j]);
+            ++nnz;
+        }
+    }
 
-        auto similarities = dot_product_sparse_matrix(
-            indices + start, values + start, len, *cluster_representatives);
+    CentroidIndex<T> index;
+    index.n_cols = nnz == 0 ? 0 : max_term + 1;
+    index.term_ptr.assign(index.n_cols + 1, 0);
+    for (const auto& cluster : clusters) {
+        const idx_t centroid = cluster.at(0);
+        for (idx_t j = indptr[centroid]; j < indptr[centroid + 1]; ++j) {
+            index.term_ptr[indices[j] + 1]++;
+        }
+    }
+    for (size_t t = 0; t < index.n_cols; ++t) {
+        index.term_ptr[t + 1] += index.term_ptr[t];
+    }
 
-        size_t best_cluster = argmax_typed(similarities);
+    index.cluster.resize(nnz);
+    index.weight.resize(nnz);
+    std::vector<idx_t> cursor(index.term_ptr.begin(), index.term_ptr.end() - 1);
+    for (size_t c = 0; c < n_clusters; ++c) {
+        const idx_t centroid = clusters[c].at(0);
+        for (idx_t j = indptr[centroid]; j < indptr[centroid + 1]; ++j) {
+            const idx_t pos = cursor[indices[j]]++;
+            index.cluster[pos] = static_cast<local_cluster_id_t>(c);
+            index.weight[pos] = values[j];
+        }
+    }
+    return index;
+}
+
+// Assign each doc to its most similar centroid by transposing the comparison:
+// walk the doc's own terms and accumulate into only those clusters whose
+// centroid shares a term, instead of scoring the doc against a dense
+// dimension x n_clusters centroid matrix. Cost falls from
+// O(n_docs * doc_nnz * n_clusters) to O(shared postings), and scratch from
+// dimension * n_clusters floats to the centroids' non-zeros — the dense matrix
+// (255 MB at dimension=30522, beta=2087) was rebuilt for every posting list and
+// dominated build time.
+template <class T>
+void map_docs_to_clusters_typed(const SparseVectors* vectors,
+                                const std::vector<idx_t>& docs,
+                                std::vector<std::vector<idx_t>>& clusters) {
+    const idx_t* indptr = vectors->indptr_data();
+    const term_t* indices = vectors->indices_data();
+    const T* values = vectors->typed_values_data<T>();
+    const size_t n_clusters = clusters.size();
+
+    const CentroidIndex<T> index = build_centroid_index<T>(vectors, clusters);
+
+    // Centroids are already members of their own cluster and must not be added
+    // again. Sorted for binary search.
+    std::vector<idx_t> centroid_ids;
+    centroid_ids.reserve(n_clusters);
+    for (const auto& cluster : clusters) {
+        centroid_ids.push_back(cluster.at(0));
+    }
+    std::ranges::sort(centroid_ids);
+
+    using acc_t = accumulator_t<T>;
+    std::vector<acc_t> similarities(n_clusters, acc_t(0));
+    for (const idx_t doc_id : docs) {
+        if (std::ranges::binary_search(centroid_ids, doc_id)) {
+            continue;
+        }
+        std::ranges::fill(similarities, acc_t(0));
+        for (idx_t j = indptr[doc_id]; j < indptr[doc_id + 1]; ++j) {
+            const size_t term = indices[j];
+            if (term >= index.n_cols) {
+                continue;  // no centroid carries this term
+            }
+            const acc_t doc_value = static_cast<acc_t>(values[j]);
+            for (idx_t p = index.term_ptr[term]; p < index.term_ptr[term + 1];
+                 ++p) {
+                similarities[index.cluster[p]] +=
+                    doc_value * static_cast<acc_t>(index.weight[p]);
+            }
+        }
+        // Strict >, ascending: ties go to the lowest cluster index, and an
+        // all-zero row lands in cluster 0, matching the previous behaviour.
+        size_t best_cluster = 0;
+        acc_t best = similarities[0];
+        for (size_t c = 1; c < n_clusters; ++c) {
+            if (similarities[c] > best) {
+                best = similarities[c];
+                best_cluster = c;
+            }
+        }
         clusters[best_cluster].push_back(doc_id);
     }
 }
 
-static void map_docs_to_clusters_avx512(
-    const SparseVectors* vectors, const std::vector<idx_t>& docs,
-    std::vector<std::vector<idx_t>>& clusters) {
-    if (vectors == nullptr) {
-        throw std::runtime_error("vectors is nullptr");
-    }
-
-    const auto element_size = vectors->get_element_size();
-
-    if (element_size == U32) {
-        map_docs_to_clusters_avx512_impl<float>(vectors, docs, clusters);
-    } else if (element_size == U16) {
-        map_docs_to_clusters_avx512_impl<uint16_t>(vectors, docs, clusters);
-    } else {
-        map_docs_to_clusters_avx512_impl<uint8_t>(vectors, docs, clusters);
-    }
-}
-
-#endif
-
-inline static float dot_product_typed_dense(const term_t* indices,
-                                            const uint8_t* values,
-                                            const uint8_t* dense, size_t offset,
-                                            size_t len, size_t element_size) {
-    if (element_size == U32) {
-        // start is element index, need byte offset for float access
-        const auto* float_values =
-            reinterpret_cast<const float*>(values) + offset;
-        const auto* float_dense = reinterpret_cast<const float*>(dense);
-        return dot_product_float_dense(indices + offset, float_values, len,
-                                       float_dense);
-    }
-    if (element_size == U16) {
-        const auto* uint16_values =
-            reinterpret_cast<const uint16_t*>(values) + offset;
-        const auto* uint16_dense = reinterpret_cast<const uint16_t*>(dense);
-        return dot_product_uint16_dense(indices + offset, uint16_values, len,
-                                        uint16_dense);
-    }
-    return dot_product_uint8_dense(indices + offset, values + offset, len,
-                                   dense);
-}
+}  // namespace
 
 void map_docs_to_clusters(const SparseVectors* vectors,
                           const std::vector<idx_t>& docs,
@@ -169,19 +165,16 @@ void map_docs_to_clusters(const SparseVectors* vectors,
     if (vectors == nullptr) {
         throw std::runtime_error("vectors is nullptr");
     }
-    size_t n_clusters = clusters.size();
-    size_t n_docs = docs.size();
-    if (n_clusters == 0 || n_docs == 0) {
+    if (clusters.empty() || docs.empty()) {
         return;
     }
-#if defined(NSPARSE_WITH_GPU) && !defined(__AVX512F__)
-    // GPU assignment (cuSPARSE) for float (U32) weights. It matches the scalar
-    // CPU path below (skips centroids); on any failure we fall through to CPU.
-    // Excluded from AVX-512 builds because that path (unlike the scalar one)
-    // does not skip centroids, so mixing GPU- and AVX-512-assigned lists in one
-    // build would be inconsistent.
+#ifdef NSPARSE_WITH_GPU
+    // GPU assignment (cuSPARSE) for float (U32) weights. It matches the CPU
+    // path below (skips centroids, ties to the lowest cluster index); on any
+    // failure we fall through to CPU. No AVX-512 exclusion is needed: there is
+    // now a single CPU path and it skips centroids like the GPU one.
     if (vectors->get_element_size() == U32 &&
-        should_offload_assignment_to_gpu(n_docs, n_clusters)) {
+        should_offload_assignment_to_gpu(docs.size(), clusters.size())) {
         try {
             GpuClusterAssigner::instance().assign(vectors, docs, clusters);
             return;
@@ -191,42 +184,14 @@ void map_docs_to_clusters(const SparseVectors* vectors,
         }
     }
 #endif
-#if defined(__AVX512F__)
-    map_docs_to_clusters_avx512(vectors, docs, clusters);
-    return;
-#else
-
-    const idx_t* indptr = vectors->indptr_data();
-    const term_t* indices = vectors->indices_data();
-    const uint8_t* values = vectors->values_data();
     const auto element_size = vectors->get_element_size();
-    for (size_t i = 0; i < n_docs; ++i) {
-        // get_dense_vector returns uint8_t buffer with element_size bytes per
-        // value
-        const auto& vec = vectors->get_dense_vector(docs[i]);
-        float max_similarity = std::numeric_limits<float>::lowest();
-        size_t best_cluster = 0;
-        bool is_centroid = false;
-        for (size_t j = 0; j < n_clusters; ++j) {
-            idx_t centroid_doc = clusters[j].at(0);
-            if (docs[i] == centroid_doc) {
-                is_centroid = true;
-                break;
-            }
-            const idx_t start = indptr[centroid_doc];
-            const size_t len = indptr[centroid_doc + 1] - start;
-            float similarity = dot_product_typed_dense(
-                indices, values, vec.data(), start, len, element_size);
-            if (similarity > max_similarity) {
-                max_similarity = similarity;
-                best_cluster = j;
-            }
-        }
-        if (!is_centroid) {
-            clusters[best_cluster].push_back(docs[i]);
-        }
+    if (element_size == U32) {
+        map_docs_to_clusters_typed<float>(vectors, docs, clusters);
+    } else if (element_size == U16) {
+        map_docs_to_clusters_typed<uint16_t>(vectors, docs, clusters);
+    } else {
+        map_docs_to_clusters_typed<uint8_t>(vectors, docs, clusters);
     }
-#endif
 }
 
 }  // namespace nsparse::detail
