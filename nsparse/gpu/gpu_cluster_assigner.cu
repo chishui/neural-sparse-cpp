@@ -147,6 +147,21 @@ bool gpu_present() {
     return status == cudaSuccess && device_count > 0;
 }
 
+// Own a cuSPARSE matrix descriptor so a throw between create and use unwinds
+// through the destroy instead of leaking the handle.
+struct SpMatGuard {
+    cusparseSpMatDescr_t desc{};
+    ~SpMatGuard() {
+        if (desc != nullptr) cusparseDestroySpMat(desc);
+    }
+};
+struct DnMatGuard {
+    cusparseDnMatDescr_t desc{};
+    ~DnMatGuard() {
+        if (desc != nullptr) cusparseDestroyDnMat(desc);
+    }
+};
+
 }  // namespace
 
 GpuClusterAssigner& GpuClusterAssigner::instance() {
@@ -235,9 +250,12 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
         static_cast<int>(n_docs), ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val);
     NSPARSE_CUDA_CHECK(cudaGetLastError());
 
-    cusparseSpMatDescr_t mat_a;
-    cusparseDnMatDescr_t mat_b;
-    cusparseDnMatDescr_t mat_c;
+    SpMatGuard a_guard;
+    DnMatGuard b_guard;
+    DnMatGuard c_guard;
+    cusparseSpMatDescr_t& mat_a = a_guard.desc;
+    cusparseDnMatDescr_t& mat_b = b_guard.desc;
+    cusparseDnMatDescr_t& mat_c = c_guard.desc;
     NSPARSE_CUSPARSE_CHECK(cusparseCreateCsr(
         &mat_a, static_cast<int64_t>(n_docs), static_cast<int64_t>(dim), nnz_a,
         ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val, CUSPARSE_INDEX_32I,
@@ -269,10 +287,6 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
         ctx.d_c, static_cast<int>(n_docs), static_cast<int>(n_clusters),
         ctx.d_best);
     NSPARSE_CUDA_CHECK(cudaGetLastError());
-
-    cusparseDestroySpMat(mat_a);
-    cusparseDestroyDnMat(mat_b);
-    cusparseDestroyDnMat(mat_c);
 
     std::vector<int32_t> h_best(n_docs);
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(h_best.data(), ctx.d_best,

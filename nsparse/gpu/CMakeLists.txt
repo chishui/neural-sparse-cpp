@@ -35,16 +35,21 @@ enable_language(CUDA)
 # CUDAToolkit provides the CUDA::cusparse and CUDA::cudart imported targets.
 find_package(CUDAToolkit REQUIRED)
 
-# Default to the common data-center / Ada architectures. L4 (this project's
-# reference GPU) is compute capability 8.9. Override with
-# -DNSPARSE_CUDA_ARCHITECTURES=... if targeting different GPUs.
+# Build SASS for the common cloud GPUs: Turing (7.5), Ampere (8.0/8.6), Ada
+# (8.9, this project's L4), Hopper (9.0). PTX JIT is forward-only, so a narrower
+# list would fail at launch on older archs ("no kernel image") — available()
+# checks device presence, not arch match. sm_70 (Volta/V100) is omitted because
+# CUDA 13 dropped it; add 70 back only with a CUDA 12 toolkit. Override with
+# -DNSPARSE_CUDA_ARCHITECTURES=... for a narrower/newer set.
 if(NSPARSE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "${NSPARSE_CUDA_ARCHITECTURES}" CACHE STRING "" FORCE)
 else()
-    set(CMAKE_CUDA_ARCHITECTURES 80 89 CACHE STRING "CUDA architectures to build for" FORCE)
+    set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90 CACHE STRING "CUDA architectures to build for" FORCE)
 endif()
 
-set(CMAKE_CUDA_STANDARD 17)
+# Match the project-wide C++ standard (CMAKE_CXX_STANDARD 20) so device TUs and
+# the host code they interoperate with compile against the same standard.
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Absolute paths to the CUDA translation units, resolved here so the helper can
@@ -53,6 +58,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(NSPARSE_GPU_SRC
     "${CMAKE_CURRENT_LIST_DIR}/gpu_cluster_assigner.cu"
     "${CMAKE_CURRENT_LIST_DIR}/gpu_summarizer.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/gpu_diagnostics.cpp"
     CACHE INTERNAL "nsparse GPU sources")
 
 message(STATUS "nsparse: GPU enabled (nvcc=${CMAKE_CUDA_COMPILER}, "

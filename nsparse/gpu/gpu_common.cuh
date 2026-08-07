@@ -18,6 +18,7 @@
 #include <stdexcept>
 
 #include "cuda_runtime.h"
+#include "nsparse/gpu/gpu_diagnostics.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 
@@ -134,6 +135,11 @@ private:
     ~GpuCorpus() { free_locked(); }
 
     void free_locked() {
+        // Drain kernels still reading the corpus before freeing it. Harmless in
+        // the current single-corpus flow (no swap after first upload); guards a
+        // future caller that switches corpora while another thread's kernels are
+        // still queued against the old one.
+        cudaDeviceSynchronize();
         cudaFree(corpus_.indptr);
         cudaFree(corpus_.indices);
         cudaFree(corpus_.values);

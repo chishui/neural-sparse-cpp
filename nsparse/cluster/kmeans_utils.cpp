@@ -20,6 +20,7 @@
 #include "nsparse/utils/distance_simd.h"
 #ifdef NSPARSE_WITH_GPU
 #include "nsparse/gpu/gpu_cluster_assigner.h"
+#include "nsparse/gpu/gpu_diagnostics.h"
 #endif
 #if defined(__AVX512F__)
 #include <memory>
@@ -184,8 +185,9 @@ void map_docs_to_clusters(const SparseVectors* vectors,
         try {
             GpuClusterAssigner::instance().assign(vectors, docs, clusters);
             return;
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
             // Fall back to CPU on any GPU error (OOM, driver, etc.).
+            warn_gpu_fallback_once("assignment", e.what());
         }
     }
 #endif

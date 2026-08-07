@@ -157,13 +157,13 @@ bool GpuSummarizer::available() {
     return present;
 }
 
-bool GpuSummarizer::summarize_list(const SparseVectors* vectors,
-                                   const idx_t* docs, const idx_t* offsets,
-                                   size_t n_clusters,
-                                   std::vector<ClusterSummary>& out) {
-    if (!available() || n_clusters == 0) {
-        return false;
-    }
+namespace {
+
+// Core max-pool. May throw on any CUDA/cuSPARSE error; summarize_list() catches
+// so nothing escapes into the OMP parallel region that calls it.
+bool summarize_list_impl(const SparseVectors* vectors, const idx_t* docs,
+                         const idx_t* offsets, size_t n_clusters,
+                         std::vector<GpuSummarizer::ClusterSummary>& out) {
     const size_t dim = vectors->get_dimension();
     const idx_t* indptr = vectors->indptr_data();
 
@@ -192,8 +192,19 @@ bool GpuSummarizer::summarize_list(const SparseVectors* vectors,
     cudaStream_t stream = ctx.stream;
 
     // acc/seen are n_clusters x dim; must start (and remain) zeroed. Zero only
-    // when (re)grown — the kernel restores touched slots.
+    // when (re)grown — the kernel restores touched slots. Every OMP worker holds
+    // its own acc+seen on the one shared device, so decline the grow (→ CPU)
+    // when it would leave less than 1/16 of device memory free, rather than OOM.
     const size_t acc_bytes = n_clusters * dim * sizeof(int32_t);
+    if (ctx.acc_cap < acc_bytes) {
+        const size_t growth = 2 * (acc_bytes - ctx.acc_cap);
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        NSPARSE_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        if (growth + total_bytes / 16 > free_bytes) {
+            return false;
+        }
+    }
     const bool acc_grew = ctx.acc_cap < acc_bytes;
     ensure_capacity(&ctx.d_acc, ctx.acc_cap, acc_bytes);
     ensure_capacity(&ctx.d_seen, ctx.seen_cap, acc_bytes);
@@ -260,7 +271,7 @@ bool GpuSummarizer::summarize_list(const SparseVectors* vectors,
     for (size_t b = 0; b < n_clusters; ++b) {
         const int32_t base = h_out_base[b];
         const int32_t cnt = h_count[b];
-        ClusterSummary& cs = out[b];
+        GpuSummarizer::ClusterSummary& cs = out[b];
         cs.terms.resize(cnt);
         cs.values.resize(cnt);
         for (int32_t k = 0; k < cnt; ++k) {
@@ -272,12 +283,31 @@ bool GpuSummarizer::summarize_list(const SparseVectors* vectors,
     return true;
 }
 
-bool should_offload_summarize_to_gpu() {
-    if (!GpuSummarizer::available()) {
+}  // namespace
+
+bool GpuSummarizer::summarize_list(const SparseVectors* vectors,
+                                   const idx_t* docs, const idx_t* offsets,
+                                   size_t n_clusters,
+                                   std::vector<ClusterSummary>& out) {
+    if (!available() || n_clusters == 0) {
         return false;
     }
-    const char* env = std::getenv("NSPARSE_GPU_SUMMARIZE");
-    return env != nullptr && env[0] == '1';
+    // Runs inside an OMP parallel region; an escaping exception calls
+    // std::terminate. Contain any CUDA/cuSPARSE error and fall back to CPU.
+    try {
+        return summarize_list_impl(vectors, docs, offsets, n_clusters, out);
+    } catch (const std::exception& e) {
+        warn_gpu_fallback_once("summarize", e.what());
+        return false;
+    }
+}
+
+bool should_offload_summarize_to_gpu() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("NSPARSE_GPU_SUMMARIZE");
+        return env != nullptr && env[0] == '1';
+    }();
+    return GpuSummarizer::available() && enabled;
 }
 
 }  // namespace nsparse::detail
