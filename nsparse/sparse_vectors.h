@@ -14,8 +14,9 @@
 #include <cstdlib>
 #include <vector>
 
-#include "nsparse/io/io.h"
+#include "nsparse/io/mmap_io.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/buf.h"
 
 namespace nsparse {
 
@@ -32,16 +33,16 @@ struct SparseVectorsData {
     const float* values_data;
 };
 
-class SparseVectors : public Serializable {
+class SparseVectors : public MmapSerializable {
 public:
     SparseVectors() = default;
     explicit SparseVectors(SparseVectorsConfig config);
     ~SparseVectors() = default;
 
-    // copy constructor
-    SparseVectors(const SparseVectors& other) = default;
-    SparseVectors& operator=(const SparseVectors& other) = default;
-    // move constructor
+    // Move-only: the buffers are either owned or borrowed, and duplicating
+    // either would mean copying the payload or the borrow silently.
+    SparseVectors(const SparseVectors& other) = delete;
+    SparseVectors& operator=(const SparseVectors& other) = delete;
     SparseVectors(SparseVectors&& other) noexcept = default;
     SparseVectors& operator=(SparseVectors&& other) noexcept = default;
 
@@ -58,6 +59,20 @@ public:
 
     void add_vector(const term_t* indices, size_t indices_size,
                     const uint8_t* weights, size_t weights_size);
+
+    // Borrows an already-final CSR layout, normally a file mapping: nothing is
+    // copied and nothing is owned, so the caller must outlive the result.
+    //
+    // Cannot append, unlike add_vectors: the offsets are already absolute and
+    // the memory is read-only. The layout is validated up front so a corrupt
+    // file fails here rather than mid-search, and `values` must be aligned for
+    // `element_size` because it is reinterpreted in place.
+    static SparseVectors map_vectors(SparseVectorsConfig config,
+                                     const idx_t* indptr, size_t indptr_size,
+                                     const term_t* indices,
+                                     size_t indices_size,
+                                     const uint8_t* values,
+                                     size_t values_size);
 
     size_t num_vectors() const;
     size_t get_dimension() const { return config_.dimension; }
@@ -86,11 +101,12 @@ public:
 
     void serialize(IOWriter* writer) const override;
     void deserialize(IOReader* reader) override;
+    void mmap_deserialize(MmapCursor* cursor) override;
 
 private:
-    std::vector<idx_t> indptr_;
-    std::vector<term_t> indices_;
-    std::vector<uint8_t> values_;
+    Buf<idx_t> indptr_;
+    Buf<term_t> indices_;
+    Buf<uint8_t> values_;
     SparseVectorsConfig config_;
 };
 

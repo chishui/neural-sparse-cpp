@@ -19,6 +19,16 @@ using idx_t = int32_t;
 using term_t = uint16_t;
 using weight_t = float;
 
+// Whether a loaded index owns its buffers or borrows them from a file mapping.
+// Lives here rather than in seismic_common.h because Index::read_csr takes it,
+// and that header pulls in the SIMD distance kernels: including it from index.h
+// puts those definitions in every translation unit, where they collide with
+// distance.h.
+enum class Residency : uint8_t {
+    kInMemory,
+    kMmap,
+};
+
 template <class T>
 using pair_of_score_id_vector_t_t =
     std::pair<std::vector<float>, std::vector<T>>;

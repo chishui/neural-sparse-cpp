@@ -143,20 +143,24 @@ TEST(InvertedListClusters, constructor_with_empty_cluster) {
     ASSERT_EQ(doc_span2.size(), 1);
 }
 
-// Copy constructor tests
-TEST(InvertedListClusters, copy_constructor_without_summaries) {
+// Move tests. The type is move-only: its arrays are Buf, which may borrow memory
+// it does not own, so copying is deleted rather than silently deep-copying.
+static_assert(!std::is_copy_constructible_v<nsparse::InvertedListClusters>);
+static_assert(!std::is_copy_assignable_v<nsparse::InvertedListClusters>);
+
+TEST(InvertedListClusters, move_constructor_without_summaries) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2, 3}};
     nsparse::InvertedListClusters original(docs);
 
-    nsparse::InvertedListClusters copy(original);
+    nsparse::InvertedListClusters moved(std::move(original));
 
-    auto doc_span = copy.get_docs(0);
+    auto doc_span = moved.get_docs(0);
     ASSERT_EQ(doc_span.size(), 2);
     ASSERT_EQ(doc_span[0], 0);
     ASSERT_EQ(doc_span[1], 1);
 }
 
-TEST(InvertedListClusters, copy_constructor_with_summaries) {
+TEST(InvertedListClusters, move_constructor_with_summaries) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2}};
     nsparse::InvertedListClusters original(docs);
 
@@ -164,38 +168,43 @@ TEST(InvertedListClusters, copy_constructor_with_summaries) {
         {{0, 1}, {0, 2}, {1, 2}}, {{1.0F, 2.0F}, {1.5F, 1.0F}, {3.0F, 2.0F}});
     original.summarize(&vectors, 1.0F);
 
-    nsparse::InvertedListClusters copy(original);
+    nsparse::InvertedListClusters moved(std::move(original));
 
-    ASSERT_EQ(copy.cluster_size(), 2);
-    // The copy must carry a working transpose: cluster 0 has term 0, cluster 1
-    // has term 2 (both with max value 1.5 across their docs' overlapping term).
-    auto term0 = summary_values_at_term<float>(copy, 0);
+    ASSERT_EQ(moved.cluster_size(), 2);
+    // The transpose must survive the move intact: cluster 0 has term 0, cluster
+    // 1 has term 2.
+    auto term0 = summary_values_at_term<float>(moved, 0);
     ASSERT_EQ(term0.size(), 2U);
     ASSERT_GT(term0[0], 0.0F);
 }
 
-// Copy assignment tests
-TEST(InvertedListClusters, copy_assignment_without_summaries) {
+TEST(InvertedListClusters, move_assignment_without_summaries) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2, 3}};
     nsparse::InvertedListClusters original(docs);
 
-    nsparse::InvertedListClusters copy;
-    copy = original;
+    nsparse::InvertedListClusters moved;
+    moved = std::move(original);
 
-    auto doc_span = copy.get_docs(1);
+    auto doc_span = moved.get_docs(1);
     ASSERT_EQ(doc_span.size(), 2);
     ASSERT_EQ(doc_span[0], 2);
     ASSERT_EQ(doc_span[1], 3);
 }
 
-TEST(InvertedListClusters, copy_assignment_self) {
-    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}};
-    nsparse::InvertedListClusters clusters(docs);
+// Move-assigning over a populated instance must release what it held rather than
+// leak it, and take on the source's contents.
+TEST(InvertedListClusters, move_assignment_over_populated) {
+    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2, 3}};
+    nsparse::InvertedListClusters original(docs);
 
-    clusters = clusters;
+    std::vector<std::vector<nsparse::idx_t>> other_docs = {{7, 8, 9}};
+    nsparse::InvertedListClusters target(other_docs);
+    target = std::move(original);
 
-    auto doc_span = clusters.get_docs(0);
+    auto doc_span = target.get_docs(0);
     ASSERT_EQ(doc_span.size(), 2);
+    ASSERT_EQ(doc_span[0], 0);
+    ASSERT_EQ(doc_span[1], 1);
 }
 
 // Summarize tests

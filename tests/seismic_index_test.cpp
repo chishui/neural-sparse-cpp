@@ -11,7 +11,9 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <map>
+#include <memory>
 #include <random>
 #include <unordered_set>
 #include <vector>
@@ -863,6 +865,136 @@ TEST(SeismicIndexSearch, search_with_id_selector_filters_results) {
     EXPECT_EQ(labels[0], 2);
     EXPECT_EQ(labels[1], 0);
     EXPECT_EQ(labels[2], -1);
+}
+
+// ============== mapped read_index tests ==============
+
+namespace {
+
+// Index file removed on destruction.
+class TempIndexFile {
+public:
+    explicit TempIndexFile(const std::string& name)
+        : path_(std::filesystem::temp_directory_path() / name) {
+        std::filesystem::remove(path_);
+    }
+    ~TempIndexFile() { std::filesystem::remove(path_); }
+
+    TempIndexFile(const TempIndexFile&) = delete;
+    TempIndexFile& operator=(const TempIndexFile&) = delete;
+
+    // write_index/read_index take char*, not const char*.
+    char* c_str() { return path_str_.data(); }
+
+private:
+    std::filesystem::path path_{};
+    std::string path_str_ = path_.string();
+};
+
+// A built index with a handful of docs. Residency is a property of the reader,
+// not of the file, so the written bytes are the same either way.
+std::unique_ptr<TestableSeismicIndex> built_index() {
+    auto index = std::make_unique<TestableSeismicIndex>(
+        5, SeismicClusterParameters{.lambda = 10, .beta = 2, .alpha = 0.5F});
+    index->add_docs({{{0, 1.0F}, {2, 2.0F}},
+                     {{1, 0.5F}, {3, 1.5F}},
+                     {{0, 0.3F}, {4, 2.5F}},
+                     {{2, 1.0F}, {3, 0.7F}, {4, 1.2F}}});
+    index->build();
+    return index;
+}
+
+std::vector<idx_t> search_top(Index* index, term_t term, int k) {
+    std::vector<idx_t> indptr = {0, 1};
+    std::vector<term_t> indices = {term};
+    std::vector<float> values = {1.0F};
+    std::vector<idx_t> labels(k, INVALID_IDX);
+    std::vector<float> distances(k, -1.0F);
+    index->search(1, indptr.data(), indices.data(), values.data(), k,
+                  distances.data(), labels.data());
+    return labels;
+}
+
+}  // namespace
+
+TEST(SeismicIndexMmapIO, mapped_read_matches_the_copying_read) {
+    TempIndexFile file("nsparse_seis_mapped.idx");
+
+    auto source = built_index();
+    write_index(source.get(), file.c_str());
+
+    // One file, read both ways: kUseMmap is all that separates the residencies.
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    std::unique_ptr<Index> copied(read_index(file.c_str()));
+
+    ASSERT_NE(mapped, nullptr);
+    ASSERT_NE(copied, nullptr);
+    ASSERT_EQ(mapped->get_vectors()->num_vectors(),
+              copied->get_vectors()->num_vectors());
+    for (term_t term = 0; term < 5; ++term) {
+        EXPECT_EQ(search_top(mapped.get(), term, 4),
+                  search_top(copied.get(), term, 4))
+            << "term " << term;
+    }
+}
+
+// The point of the mapped path: the arrays point into the file, not into fresh
+// allocations.
+TEST(SeismicIndexMmapIO, mapped_read_borrows_from_the_file) {
+    TempIndexFile file("nsparse_seis_borrow.idx");
+    auto source = built_index();
+    write_index(source.get(), file.c_str());
+
+    std::unique_ptr<Index> loaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+
+    const auto* vectors = loaded->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    // A borrowed CSR keeps the file's contiguity: indices sit right after
+    // indptr, which is only true of the mapping, not of separate allocations.
+    const auto* indptr_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indptr_data());
+    const auto* indices_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indices_data());
+    EXPECT_EQ(indices_bytes - indptr_bytes,
+              static_cast<ptrdiff_t>((vectors->num_vectors() + 1) *
+                                     sizeof(idx_t)));
+}
+
+// A stream has no file to map, so the flag alone must not send read_index down
+// the mapped path.
+TEST(SeismicIndexMmapIO, buffered_read_copies_even_when_the_flag_is_set) {
+    auto source = built_index();
+
+    BufferedIOWriter writer;
+    write_index(source.get(), &writer);
+
+    BufferedIOReader reader(writer.data());
+    std::unique_ptr<Index> loaded(read_index(&reader, IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    const auto* vectors = loaded->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    EXPECT_EQ(vectors->num_vectors(), 4);
+    // Copied out, so nothing points into the writer's buffer.
+    const auto* base = writer.data().data();
+    const auto* end = base + writer.data().size();
+    const auto* indptr =
+        reinterpret_cast<const uint8_t*>(vectors->indptr_data());
+    EXPECT_TRUE(indptr < base || indptr >= end);
+}
+
+TEST(SeismicIndexMmapIO, mapped_read_of_an_empty_index) {
+    TempIndexFile file("nsparse_seis_empty_mapped.idx");
+    SeismicIndex source(5, {.lambda = 10, .beta = 2, .alpha = 0.5F});
+    write_index(&source, file.c_str());
+
+    std::unique_ptr<Index> loaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->get_vectors(), nullptr);
 }
 
 }  // namespace

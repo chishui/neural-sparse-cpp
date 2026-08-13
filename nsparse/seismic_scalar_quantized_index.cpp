@@ -336,14 +336,14 @@ void SeismicScalarQuantizedIndex::write_index(IOWriter* io_writer) {
     inv_list_writer.serialize(io_writer);
 }
 
-void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader) {
+void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader, int io_flags) {
     read_header(io_reader);
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
     if (tmp_vectors.num_vectors() > 0) {
         vectors_ = std::make_unique<SparseVectors>(std::move(tmp_vectors));
     }
-    SeismicInvertedListsWriter inv_list_writer({});
+    SeismicInvertedListsWriter inv_list_writer;
     inv_list_writer.deserialize(io_reader);
     clustered_inverted_lists = std::move(inv_list_writer.release());
 }

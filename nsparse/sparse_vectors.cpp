@@ -9,16 +9,77 @@
 
 #include "nsparse/sparse_vectors.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 
+#include "nsparse/io/align.h"
 #include "nsparse/io/io.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
+#include "nsparse/utils/mmap_file.h"
 
 namespace nsparse {
 SparseVectors::SparseVectors(SparseVectorsConfig config) : config_(config) {
     throw_if_not_positive(config_.dimension);
+}
+
+SparseVectors SparseVectors::map_vectors(SparseVectorsConfig config,
+                                         const idx_t* indptr,
+                                         size_t indptr_size,
+                                         const term_t* indices,
+                                         size_t indices_size,
+                                         const uint8_t* values,
+                                         size_t values_size) {
+    throw_if_not_positive(config.dimension);
+    if (config.element_size != U8 && config.element_size != U16 &&
+        config.element_size != U32 && config.element_size != U64) {
+        throw std::invalid_argument("Invalid element size");
+    }
+
+    SparseVectors vectors;
+    vectors.config_ = config;
+    if (indptr_size == 0) {
+        return vectors;  // nothing mapped
+    }
+    throw_if_null(indptr, "Mapped indptr must not be null");
+    // A matrix whose every row is empty has no indices and no values, and an
+    // empty array has no address to hand out; only a non-empty one must be real.
+    if (indices_size > 0) {
+        throw_if_any_null(indices, values);
+    }
+
+    if (indices_size * config.element_size != values_size) {
+        throw std::invalid_argument(
+            "Indices and weights must have the same size");
+    }
+    // Reinterpreted in place, so a misaligned start is UB on x86 and faults on
+    // ARM. Writers pad the array up to element_size to keep this satisfiable.
+    if (reinterpret_cast<uintptr_t>(values) % config.element_size != 0) {
+        throw std::invalid_argument(
+            "Mapped values are misaligned for the element size");
+    }
+
+    // Search dereferences indptr and indices to reach a row, so validate once
+    // here rather than per query.
+    if (indptr[0] != 0) {
+        throw std::invalid_argument("Mapped indptr must start at 0");
+    }
+    for (size_t i = 1; i < indptr_size; ++i) {
+        if (indptr[i] < indptr[i - 1]) {
+            throw std::invalid_argument("Mapped indptr is not monotonic");
+        }
+    }
+    if (static_cast<size_t>(indptr[indptr_size - 1]) != indices_size) {
+        throw std::invalid_argument(
+            "Mapped indptr does not end at the index count");
+    }
+
+    vectors.indptr_ = Buf<idx_t>::borrow(indptr, indptr_size);
+    vectors.indices_ = Buf<term_t>::borrow(indices, indices_size);
+    vectors.values_ = Buf<uint8_t>::borrow(values, values_size);
+    return vectors;
 }
 
 void SparseVectors::add_vectors(const std::vector<idx_t>& indptr,
@@ -38,20 +99,30 @@ void SparseVectors::add_vectors(const idx_t* indptr, size_t indptr_size,
     if (indptr_size < 2) {
         return;  // Nothing to add
     }
-    if (this->indptr_.empty()) {
-        this->indptr_.push_back(0);
+    // Always copies: the arguments are often a caller-local buffer (freshly
+    // quantized codes, say), and the incoming offsets are rebased onto what is
+    // already stored. Borrowing is map_vectors' job.
+    std::vector<idx_t> indptr_vec = indptr_.take_vector();
+    std::vector<term_t> indices_vec = indices_.take_vector();
+    std::vector<uint8_t> values_vec = values_.take_vector();
+
+    if (indptr_vec.empty()) {
+        indptr_vec.push_back(0);
     }
 
     // Append new indices
-    this->indices_.insert(this->indices_.end(), indices,
-                          indices + indices_size);
+    indices_vec.insert(indices_vec.end(), indices, indices + indices_size);
 
     // Append weights directly (already in uint8_t format)
-    this->values_.insert(this->values_.end(), weights, weights + weights_size);
-    idx_t offset = this->indptr_.back();
+    values_vec.insert(values_vec.end(), weights, weights + weights_size);
+    idx_t offset = indptr_vec.back();
     for (size_t i = 1; i < indptr_size; ++i) {
-        this->indptr_.push_back(indptr[i] + offset);
+        indptr_vec.push_back(indptr[i] + offset);
     }
+
+    indptr_ = Buf<idx_t>::own(std::move(indptr_vec));
+    indices_ = Buf<term_t>::own(std::move(indices_vec));
+    values_ = Buf<uint8_t>::own(std::move(values_vec));
 }
 
 void SparseVectors::add_vector(const std::vector<term_t>& indices,
@@ -61,18 +132,26 @@ void SparseVectors::add_vector(const std::vector<term_t>& indices,
 
 void SparseVectors::add_vector(const term_t* indices, size_t indices_size,
                                const uint8_t* weights, size_t weights_size) {
+    // Copies for the same reason add_vectors does; see the note there.
+    std::vector<idx_t> indptr_vec = indptr_.take_vector();
+    std::vector<term_t> indices_vec = indices_.take_vector();
+    std::vector<uint8_t> values_vec = values_.take_vector();
+
     // Get the current offset (where the new vector starts)
-    idx_t offset = this->indptr_.empty() ? 0 : this->indptr_.back();
+    idx_t offset = indptr_vec.empty() ? 0 : indptr_vec.back();
 
     // If this is the first vector, initialize indptr with 0
-    if (this->indptr_.empty()) {
-        this->indptr_.push_back(0);
+    if (indptr_vec.empty()) {
+        indptr_vec.push_back(0);
     }
 
-    this->indices_.insert(this->indices_.end(), indices,
-                          indices + indices_size);
-    this->values_.insert(this->values_.end(), weights, weights + weights_size);
-    this->indptr_.push_back(offset + static_cast<idx_t>(indices_size));
+    indices_vec.insert(indices_vec.end(), indices, indices + indices_size);
+    values_vec.insert(values_vec.end(), weights, weights + weights_size);
+    indptr_vec.push_back(offset + static_cast<idx_t>(indices_size));
+
+    indptr_ = Buf<idx_t>::own(std::move(indptr_vec));
+    indices_ = Buf<term_t>::own(std::move(indices_vec));
+    values_ = Buf<uint8_t>::own(std::move(values_vec));
 }
 
 std::vector<float> SparseVectors::get_dense_vector_float(
@@ -132,13 +211,25 @@ void SparseVectors::serialize(IOWriter* io_writer) const {
         io_writer->write(&dimension, sizeof(size_t), 1);
         auto element_size = get_element_size();
         io_writer->write(&element_size, sizeof(size_t), 1);
+
+        // Each array is padded to its own alignment so a mapped reader can
+        // borrow it in place; see io/align.h. The header above is three size_t,
+        // so indptr needs none in practice, but the layout should not depend on
+        // that.
         size_t indptr_size = vector_count + 1;
+        io_align::pad_to(io_writer, alignof(idx_t));
         io_writer->write(const_cast<idx_t*>(indptr_.data()), sizeof(idx_t),
                          indptr_size);
+
         size_t indices_size = indptr_[vector_count];
+        io_align::pad_to(io_writer, alignof(term_t));
         io_writer->write(const_cast<term_t*>(indices_.data()), sizeof(term_t),
                          indices_size);
+
+        // Values are bytes on the wire but reinterpreted as element_size-wide
+        // words on read, so they are padded to that width, not to 1.
         size_t value_size = indptr_[vector_count] * element_size;
+        io_align::pad_to(io_writer, element_size);
         io_writer->write(const_cast<uint8_t*>(values_.data()), sizeof(uint8_t),
                          value_size);
     }
@@ -154,17 +245,47 @@ void SparseVectors::deserialize(IOReader* io_reader) {
         io_reader->read(&element_size, sizeof(size_t), 1);
         config_ = SparseVectorsConfig(element_size, dimension);
 
+        // Skips the padding serialize() wrote before each array.
         size_t indptr_size = vector_count + 1;
-        indptr_.resize(indptr_size);
-        io_reader->read(indptr_.data(), sizeof(idx_t), indptr_size);
+        indptr_ = io_align::read_padded<idx_t>(io_reader, indptr_size);
 
         size_t indices_size = indptr_[vector_count];
-        indices_.resize(indices_size);
-        io_reader->read(indices_.data(), sizeof(term_t), indices_size);
+        indices_ = io_align::read_padded<term_t>(io_reader, indices_size);
 
-        size_t value_size = indptr_[vector_count] * element_size;
-        values_.resize(value_size);
-        io_reader->read(values_.data(), sizeof(uint8_t), value_size);
+        size_t value_size = indices_size * element_size;
+        values_ = io_align::read_padded<uint8_t>(io_reader, value_size, element_size);
     }
+}
+
+void SparseVectors::mmap_deserialize(MmapCursor* cursor) {
+    throw_if_null(cursor, "cursor must not be null");
+    // Same layout deserialize() walks, borrowed rather than copied. The scalars
+    // are still read out: they are small, and copying them keeps the mapped
+    // object independent of the file for everything but the arrays.
+    const auto vector_count = cursor->read_scalar<size_t>();
+    if (vector_count == 0) {
+        *this = SparseVectors();
+        return;
+    }
+    const auto dimension = cursor->read_scalar<size_t>();
+    const auto element_size = cursor->read_scalar<size_t>();
+
+    const size_t indptr_size = vector_count + 1;
+    cursor->skip(io_align::padding_for(cursor->pos(), alignof(idx_t)));
+    const idx_t* indptr = cursor->read_array<idx_t>(indptr_size);
+
+    const auto indices_size = static_cast<size_t>(indptr[vector_count]);
+    cursor->skip(io_align::padding_for(cursor->pos(), alignof(term_t)));
+    const term_t* indices = cursor->read_array<term_t>(indices_size);
+
+    const size_t value_size = indices_size * element_size;
+    cursor->skip(io_align::padding_for(cursor->pos(), element_size));
+    const uint8_t* values = cursor->read_array<uint8_t>(value_size);
+
+    // map_vectors validates before borrowing, so a corrupt file throws here
+    // rather than faulting mid-search.
+    *this = map_vectors({.element_size = element_size, .dimension = dimension},
+                        indptr, indptr_size, indices, indices_size, values,
+                        value_size);
 }
 }  // namespace nsparse

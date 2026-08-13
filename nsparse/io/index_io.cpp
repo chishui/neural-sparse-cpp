@@ -9,6 +9,8 @@
 
 #include "nsparse/io/index_io.h"
 
+#include <cstdint>
+#include <functional>
 #include <stdexcept>
 
 #include "nsparse/brutal_index.h"
@@ -26,6 +28,15 @@ constexpr uint32_t SEIS = fourcc(SeismicIndex::name);
 constexpr uint32_t SESQ = fourcc(SeismicScalarQuantizedIndex::name);
 constexpr uint32_t IDMP = fourcc(IDMapIndex::name);
 constexpr uint32_t INVT = fourcc(InvertedIndex::name);
+
+// Closed here rather than in a scope guard: close() reports flush/fclose
+// failures by throwing, which a destructor cannot forward.
+template <class T>
+void close_stream(T* stream, bool keep_open) {
+    if (!keep_open) {
+        stream->close();
+    }
+}
 
 void write_header(Index* index, IOWriter* io_writer) {
     // write index type
@@ -61,28 +72,40 @@ Index* read_header(IOReader* io_reader) {
 namespace detail {
 void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     auto* index_io = dynamic_cast<IndexIO*>(index);
+    auto auto_close = [keep_open](auto* stream) { close_stream(stream, keep_open); };
+    auto io_writer_ptr = std::unique_ptr<IOWriter, decltype(auto_close)>(io_writer, auto_close);
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
     // write header
-    write_header(index, io_writer);
+    write_header(index, io_writer_ptr.get());
     // write index customized payload
-    index_io->write_index(io_writer);
-    if (!keep_open) {
-        io_writer->close();
-    }
+    index_io->write_index(io_writer_ptr.get());
 }
 
-Index* read_index(IOReader* io_reader, bool keep_open) {
-    Index* index = read_header(io_reader);
+Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
+    auto auto_close = [keep_open](auto* stream) { close_stream(stream, keep_open); };
+    std::unique_ptr<IOReader, decltype(auto_close)> io_reader_ptr(io_reader, auto_close);
+    Index* index = read_header(io_reader_ptr.get());
     auto* index_io = dynamic_cast<IndexIO*>(index);
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
-    index_io->read_index(io_reader);
-    if (!keep_open) {
-        io_reader->close();
+
+    // handle mmap
+    if (fourcc(index->id()) == SEIS &&
+        (io_flags & IndexIoFlag::kUseMmap) == IndexIoFlag::kUseMmap) {
+        if (auto* file_io_reader = dynamic_cast<FileIOReader*>(io_reader)) {
+            int dimension = index->get_dimension();
+            // Where the payload starts, which is what serialize() padded against.
+            size_t pos = io_reader_ptr->pos();
+            delete index;
+            io_reader_ptr.reset();
+            return SeismicIndex::mmap_index(dimension, file_io_reader->file_name().c_str(), pos);
+        }
     }
+
+    index_io->read_index(io_reader_ptr.get(), io_flags);
     return index;
 }
 }  // namespace detail
@@ -91,17 +114,17 @@ void write_index(Index* index, IOWriter* io_writer) {
     detail::write_index(index, io_writer, false);
 }
 
-void write_index(Index* index, char* filename) {
-    FileIOWriter writer(filename);
+void write_index(Index* index, char* file_name) {
+    FileIOWriter writer(file_name);
     write_index(index, &writer);
 }
 
-Index* read_index(IOReader* io_reader) {
-    return detail::read_index(io_reader, false);
+Index* read_index(IOReader* io_reader, int io_flags) {
+    return detail::read_index(io_reader, false, io_flags);
 }
 
-Index* read_index(char* filename) {
-    FileIOReader reader(filename);
-    return read_index(&reader);
+Index* read_index(char* file_name, int io_flags) {
+    FileIOReader reader(file_name);
+    return read_index(&reader, io_flags);
 }
 }  // namespace nsparse

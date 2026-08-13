@@ -22,6 +22,7 @@ set(NSPARSE_SRC
     io/file_io.cpp
     io/index_io.cpp
     io/inline_forward_index_writer.cpp
+    utils/csr_layout.cpp
 )
 
 set(NSPARSE_HEADERS
@@ -29,13 +30,18 @@ set(NSPARSE_HEADERS
     types.h
     sparse_vectors.h
     brutal_index.h
+    mmap_index.h
     seismic_index.h
     seismic_scalar_quantized_index.h
     inline_forward_index.h
     index_factory.h
     id_map_index.h
     inverted_index.h
+    utils/buf.h
+    utils/csr_layout.h
     utils/checks.h
+    utils/mmap_file.h
+    utils/mmap_cursor.h
     utils/distance.h
     utils/distance_avx512.h
     utils/distance_avx2.h
@@ -49,6 +55,7 @@ set(NSPARSE_HEADERS
     cluster/inverted_list_clusters.h
     invlists/inverted_lists.h
     io/io.h
+    io/align.h
     io/buffered_io.h
     io/seismic_invlists_writer.h
     io/inline_forward_index_writer.h

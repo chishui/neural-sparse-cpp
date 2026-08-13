@@ -39,6 +39,7 @@ public:
         idx_t n, const idx_t* indptr, const term_t* indices,
         const float* values, int k, float* distances, idx_t* labels,
         SearchParameters* search_parameters = nullptr);  // Pre-allocated: n * k
+
     virtual const SparseVectors* get_vectors() const { return nullptr; };
 
     int get_dimension() const { return dimension_; }
@@ -49,6 +50,10 @@ public:
     virtual void add_with_ids(idx_t n, const idx_t* indptr,
                               const term_t* indices, const float* values,
                               const idx_t* ids);
+
+    // File layout: int64 header (rows, cols, nnz), then int64 indptr
+    // (rows + 1 entries), int32 indices and float32 values (nnz each).
+    virtual void read_csr(const char* file_path, Residency residency = Residency::kInMemory);
 
 protected:
     virtual auto search(idx_t n, const idx_t* indptr, const term_t* indices,

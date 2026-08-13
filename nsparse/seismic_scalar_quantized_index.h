@@ -56,7 +56,7 @@ public:
 private:
     // interfaces of IndexIO
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader) override;
+    void read_index(IOReader* io_reader, int io_flags = 0) override;
     void write_header(IOWriter* io_writer);
     void read_header(IOReader* io_reader);
 

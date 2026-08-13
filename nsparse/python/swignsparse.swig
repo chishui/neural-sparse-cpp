@@ -35,10 +35,26 @@
 import_array();
 %}
 
+%include <std_string.i>
 %include "nsparse_typemaps.i"
 %include "factory.i"
 %include "nsparse/io/io.h"
 %include "nsparse/types.h"
+
+// read_csr(path, Residency::kMmap) only accepts the native layout, so without a
+// way to produce one the mapped residency is unreachable from Python. convert()
+// is also where an out-of-range term is rejected; the mapped reader trusts its
+// input and does not rescan.
+%include "nsparse/utils/csr_layout.h"
+// The mmap plumbing stays internal, and %ignore only takes effect ahead of the
+// %include that pulls the declarations in. mmap_deserialize takes an MmapCursor,
+// a type this interface does not wrap, so leaving it in makes SWIG emit the
+// parameter unqualified and the generated wrapper stops compiling. map_vectors
+// returns an object borrowing from a mapping the caller must outlive -- a
+// contract Python's refcounting cannot express. Mapping is reached from Python
+// through read_index(file, kUseMmap), which owns the mapping it hands back.
+%ignore nsparse::SparseVectors::mmap_deserialize;
+%ignore nsparse::SparseVectors::map_vectors;
 %include "nsparse/sparse_vectors.h"
 %include "nsparse/invlists/inverted_lists.h"
 %include "nsparse/utils/scalar_quantizer.h"
@@ -72,6 +88,10 @@ import_array();
 %ignore nsparse::IDMapIndex::read_index;
 %ignore nsparse::SparseVectors::serialize;
 %ignore nsparse::SparseVectors::deserialize;
+
+// Hands back an index borrowing from a mapping it does not own; see the
+// SparseVectors mmap ignores above.
+%ignore nsparse::SeismicIndex::mmap_index;
 %ignore nsparse::InvertedListClusters::serialize;
 %ignore nsparse::InvertedListClusters::deserialize;
 %ignore nsparse::detail; 
@@ -113,6 +133,12 @@ import_array();
 }
 
 %include "nsparse/index.h"
+
+// SeismicIndex derives from MmapIndex, so SWIG has to be told that class exists:
+// without it the base is dropped and the Python SeismicIndex silently loses
+// everything Index declares -- search, num_vectors, read_csr.
+%include "nsparse/mmap_index.h"
+
 %include "nsparse/brutal_index.h"
 %include "nsparse/seismic_common.h"
 %include "nsparse/seismic_index.h"

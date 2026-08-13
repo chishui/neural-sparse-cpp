@@ -95,7 +95,7 @@ public:
     void add_with_ids(idx_t n, const idx_t* indptr, const term_t* indices,
                       const float* values, const idx_t* ids) override;
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader) override;
+    void read_index(IOReader* io_reader, int io_flags = 0) override;
 
 private:
     // Owns the wrapped delegate index. Using unique_ptr ensures the delegate is

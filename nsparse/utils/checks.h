@@ -55,5 +55,19 @@ template <typename T, typename U>
         throw std::invalid_argument(msg);
     }
 }
+
+template <typename... Args>
+void throw_if_any_non_null(const char* msg, Args*... ptrs) {
+    bool any_non_null = ((ptrs != nullptr) || ...);
+    if (any_non_null) {
+        throw std::invalid_argument(msg);
+    }
+}
+
+template <typename... Args>
+void throw_if_any_non_null(Args*... ptrs) {
+    throw_if_any_non_null("pointer cannot be reassigned", ptrs...);
+}
+
 }  // namespace nsparse
 #endif  // COMMON_H

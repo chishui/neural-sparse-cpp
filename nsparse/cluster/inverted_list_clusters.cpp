@@ -19,8 +19,11 @@
 #include <utility>
 #include <vector>
 
+#include "nsparse/io/align.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/checks.h"
+#include "nsparse/utils/mmap_file.h"
 #ifdef NSPARSE_WITH_GPU
 #include "nsparse/gpu/gpu_summarizer.h"
 #endif
@@ -68,9 +71,8 @@ void summarize_emit_cluster_(std::vector<std::pair<term_t, T>>& pairs,
 // acc==0), robust to zero-valued weights.
 template <class T>
 SparseVectors summarize_with_cpu_(const SparseVectors* vectors,
-                                  const std::vector<idx_t>& group_of_doc_ids,
-                                  const std::vector<idx_t>& offsets,
-                                  float alpha) {
+                                  std::span<const idx_t> group_of_doc_ids,
+                                  std::span<const idx_t> offsets, float alpha) {
     SparseVectors out({.element_size = vectors->get_element_size(),
                        .dimension = vectors->get_dimension()});
     const size_t n_clusters = offsets.size() - 1;
@@ -127,8 +129,8 @@ SparseVectors summarize_with_cpu_(const SparseVectors* vectors,
 // declines (unavailable / empty list) so the caller falls back to the CPU path.
 template <class T>
 std::optional<SparseVectors> summarize_with_gpu_(
-    const SparseVectors* vectors, const std::vector<idx_t>& group_of_doc_ids,
-    const std::vector<idx_t>& offsets, float alpha) {
+    const SparseVectors* vectors, std::span<const idx_t> group_of_doc_ids,
+    std::span<const idx_t> offsets, float alpha) {
     if constexpr (!std::is_same_v<T, float>) {
         return std::nullopt;  // GPU max-pool is float-only
     } else {
@@ -167,8 +169,8 @@ std::optional<SparseVectors> summarize_with_gpu_(
  */
 template <class T>
 SparseVectors summarize_(const SparseVectors* vectors,
-                         const std::vector<idx_t>& group_of_doc_ids,
-                         const std::vector<idx_t>& offsets, float alpha) {
+                         std::span<const idx_t> group_of_doc_ids,
+                         std::span<const idx_t> offsets, float alpha) {
     if (offsets.size() <= 1) {
         return SparseVectors({.element_size = vectors->get_element_size(),
                               .dimension = vectors->get_dimension()});
@@ -191,52 +193,53 @@ SparseVectors summarize_(const SparseVectors* vectors,
 InvertedListClusters::InvertedListClusters(
     const std::vector<std::vector<idx_t>>& docs) {
     if (docs.empty()) return;
-    offsets_.reserve(docs.size() + 1);
-    offsets_.push_back(0);
+    // Flattened into locals and handed over at the end: a Buf is fixed-length,
+    // so it cannot be appended to in place.
+    std::vector<idx_t> flat_docs;
+    std::vector<idx_t> offsets;
+    offsets.reserve(docs.size() + 1);
+    offsets.push_back(0);
     for (const auto& doc_ids : docs) {
-        docs_.insert(docs_.end(), doc_ids.begin(), doc_ids.end());
-        offsets_.push_back(docs_.size());
+        flat_docs.insert(flat_docs.end(), doc_ids.begin(), doc_ids.end());
+        offsets.push_back(static_cast<idx_t>(flat_docs.size()));
     }
+    docs_ = Buf<idx_t>::own(std::move(flat_docs));
+    offsets_ = Buf<idx_t>::own(std::move(offsets));
 }
-
-InvertedListClusters::InvertedListClusters(const InvertedListClusters& other) =
-    default;
-InvertedListClusters& InvertedListClusters::operator=(
-    const InvertedListClusters& other) = default;
 
 auto InvertedListClusters::get_docs(idx_t idx) const -> std::span<const idx_t> {
     return {docs_.data() + offsets_[idx],
             static_cast<size_t>(offsets_[idx + 1] - offsets_[idx])};
 }
 
-void InvertedListClusters::summarize(const SparseVectors* vectors,
-                                     float alpha) {
+void InvertedListClusters::summarize(const SparseVectors* vectors, float alpha) {
     const auto element_size = vectors->get_element_size();
+    const std::span<const idx_t> docs = docs_.span();
+    const std::span<const idx_t> offsets = offsets_.span();
     SparseVectors summaries;
     if (element_size == U32) {
-        summaries = summarize_<float>(vectors, docs_, offsets_, alpha);
+        summaries = summarize_<float>(vectors, docs, offsets, alpha);
     } else if (element_size == U16) {
-        summaries = summarize_<uint16_t>(vectors, docs_, offsets_, alpha);
+        summaries = summarize_<uint16_t>(vectors, docs, offsets, alpha);
     } else {
-        summaries = summarize_<uint8_t>(vectors, docs_, offsets_, alpha);
+        summaries = summarize_<uint8_t>(vectors, docs, offsets, alpha);
     }
     build_transpose(summaries);
 }
 
-// Build the term-major (CSC) transpose directly from a per-cluster CSR summary.
-// The CSR summary is transient; only the transpose is retained.
 void InvertedListClusters::build_transpose(const SparseVectors& summaries) {
     n_clusters_ = summaries.num_vectors();
     element_size_ = summaries.get_element_size();
-    term_ids_.clear();
-    term_ptr_.clear();
-    csc_cluster_.clear();
-    csc_value_.clear();
+    // Reassigned wholesale below, so an early return leaves them empty rather
+    // than holding a previous build's transpose.
+    term_ids_ = {};
+    term_ptr_ = {};
+    csc_cluster_ = {};
+    csc_value_ = {};
     if (n_clusters_ == 0) {
         return;
     }
-    // cluster_id_t (uint16) must be able to represent every cluster index in
-    // this list; beta keeps this well under 2^16 for any workable config.
+    // Every cluster index must fit in cluster_id_t; see its declaration.
     assert(n_clusters_ <= std::numeric_limits<cluster_id_t>::max() + size_t{1});
 
     const auto* indptr = summaries.indptr_data();
@@ -245,41 +248,48 @@ void InvertedListClusters::build_transpose(const SparseVectors& summaries) {
     const size_t nnz = static_cast<size_t>(indptr[n_clusters_]);
     const size_t esz = element_size_;
 
-    // Distinct summary terms, ascending. Collected by sort+unique over the
-    // summary indices so no dimension-sized scratch is needed (the working set
-    // stays proportional to nnz).
-    term_ids_.assign(indices, indices + nnz);
-    std::ranges::sort(term_ids_);
-    term_ids_.erase(std::ranges::unique(term_ids_).begin(), term_ids_.end());
-    const size_t n_terms = term_ids_.size();
+    // Built in locals and handed to Buf::own at the end: a Buf is read-only and
+    // fixed-length, so the counting sort cannot fill one in place.
 
-    // Maps a term to its index in term_ids_ (its CSC column).
-    auto term_column = [this](term_t term) -> size_t {
-        return static_cast<size_t>(std::ranges::lower_bound(term_ids_, term) -
-                                   term_ids_.begin());
+    // Distinct summary terms, ascending. sort+unique over the summary indices
+    // keeps the working set proportional to nnz, not to the dimension.
+    std::vector<term_t> term_ids(indices, indices + nnz);
+    std::ranges::sort(term_ids);
+    term_ids.erase(std::ranges::unique(term_ids).begin(), term_ids.end());
+    const size_t n_terms = term_ids.size();
+
+    // Maps a term to its index in term_ids (its CSC column).
+    auto term_column = [&term_ids](term_t term) -> size_t {
+        return static_cast<size_t>(std::ranges::lower_bound(term_ids, term) -
+                                   term_ids.begin());
     };
 
-    // Count entries per term, then prefix-sum into CSC offsets term_ptr_.
-    term_ptr_.assign(n_terms + 1, 0);
+    // Counting sort: entries per term, prefix-summed into the CSC offsets.
+    std::vector<idx_t> term_ptr(n_terms + 1, 0);
     for (size_t j = 0; j < nnz; ++j) {
-        term_ptr_[term_column(indices[j]) + 1]++;
+        term_ptr[term_column(indices[j]) + 1]++;
     }
-    for (size_t t = 0; t < n_terms; ++t) term_ptr_[t + 1] += term_ptr_[t];
+    for (size_t t = 0; t < n_terms; ++t) term_ptr[t + 1] += term_ptr[t];
 
-    csc_cluster_.resize(nnz);
-    csc_value_.resize(nnz * esz);
-    std::vector<idx_t> cursor(term_ptr_.begin(), term_ptr_.end() - 1);
+    std::vector<cluster_id_t> csc_cluster(nnz);
+    std::vector<uint8_t> csc_value(nnz * esz);
+    std::vector<idx_t> cursor(term_ptr.begin(), term_ptr.end() - 1);
     for (size_t cluster = 0; cluster < n_clusters_; ++cluster) {
         const idx_t start = indptr[cluster];
         const idx_t end = indptr[cluster + 1];
         for (idx_t j = start; j < end; ++j) {
             const size_t col = term_column(indices[j]);
             const idx_t pos = cursor[col]++;
-            csc_cluster_[pos] = static_cast<cluster_id_t>(cluster);
+            csc_cluster[pos] = static_cast<cluster_id_t>(cluster);
             std::copy_n(values + static_cast<size_t>(j) * esz, esz,
-                        csc_value_.data() + static_cast<size_t>(pos) * esz);
+                        csc_value.data() + static_cast<size_t>(pos) * esz);
         }
     }
+
+    term_ids_ = Buf<term_t>::own(std::move(term_ids));
+    term_ptr_ = Buf<idx_t>::own(std::move(term_ptr));
+    csc_cluster_ = Buf<cluster_id_t>::own(std::move(csc_cluster));
+    csc_value_ = Buf<uint8_t>::own(std::move(csc_value));
 }
 
 template <class T>
@@ -289,8 +299,7 @@ void InvertedListClusters::score_summaries_typed(
     const T* csc_values = reinterpret_cast<const T*>(csc_value_.data());
     for (size_t i = 0; i < q_len; ++i) {
         const term_t term = q_idx[i];
-        // Locate the query term among the summaries' distinct terms. Absent
-        // terms (including any out of the summaries' range) contribute nothing.
+        // Terms absent from the summaries contribute nothing.
         auto it = std::ranges::lower_bound(term_ids_, term);
         if (it == term_ids_.end() || *it != term) {
             continue;
@@ -322,14 +331,18 @@ void InvertedListClusters::score_summaries_transposed(
 }
 
 void InvertedListClusters::serialize(IOWriter* writer) const {
+    // Each array is preceded by padding to its element's alignment so a mapped
+    // reader can borrow it in place; see io/align.h.
     size_t n_docs = docs_.size();
     writer->write(&n_docs, sizeof(size_t), 1);
     if (n_docs > 0) {
+        io_align::pad_to(writer, alignof(idx_t));
         writer->write(const_cast<idx_t*>(docs_.data()), sizeof(idx_t), n_docs);
     }
     size_t n_offsets = offsets_.size();
     writer->write(&n_offsets, sizeof(size_t), 1);
     if (n_offsets > 0) {
+        io_align::pad_to(writer, alignof(idx_t));
         writer->write(const_cast<idx_t*>(offsets_.data()), sizeof(idx_t),
                       n_offsets);
     }
@@ -342,16 +355,24 @@ void InvertedListClusters::serialize(IOWriter* writer) const {
     size_t n_terms = term_ids_.size();
     writer->write(&n_terms, sizeof(size_t), 1);
     if (n_terms > 0) {
+        io_align::pad_to(writer, alignof(term_t));
         writer->write(const_cast<term_t*>(term_ids_.data()), sizeof(term_t),
                       n_terms);
+        // term_ids_ is 2 bytes wide, so an odd term count leaves this 4-byte
+        // array off its boundary without the pad.
+        io_align::pad_to(writer, alignof(idx_t));
         writer->write(const_cast<idx_t*>(term_ptr_.data()), sizeof(idx_t),
                       n_terms + 1);
     }
     size_t nnz = csc_cluster_.size();
     writer->write(&nnz, sizeof(size_t), 1);
     if (nnz > 0) {
+        io_align::pad_to(writer, alignof(cluster_id_t));
         writer->write(const_cast<cluster_id_t*>(csc_cluster_.data()),
                       sizeof(cluster_id_t), nnz);
+        // Values are bytes on the wire but reinterpreted as element_size-wide
+        // words on read, so they are padded to that width, not to 1.
+        io_align::pad_to(writer, element_size_);
         writer->write(const_cast<uint8_t*>(csc_value_.data()), sizeof(uint8_t),
                       nnz * element_size_);
     }
@@ -360,34 +381,67 @@ void InvertedListClusters::serialize(IOWriter* writer) const {
 void InvertedListClusters::deserialize(IOReader* reader) {
     size_t n_docs = 0;
     reader->read(&n_docs, sizeof(size_t), 1);
-    if (n_docs > 0) {
-        docs_.resize(n_docs);
-        reader->read(docs_.data(), sizeof(idx_t), n_docs);
-    }
+    docs_ = io_align::read_padded<idx_t>(reader, n_docs);
     size_t n_offsets = 0;
     reader->read(&n_offsets, sizeof(size_t), 1);
-    if (n_offsets > 0) {
-        offsets_.resize(n_offsets);
-        reader->read(offsets_.data(), sizeof(idx_t), n_offsets);
-    }
+    offsets_ = io_align::read_padded<idx_t>(reader, n_offsets);
 
     reader->read(&n_clusters_, sizeof(size_t), 1);
     reader->read(&element_size_, sizeof(size_t), 1);
     size_t n_terms = 0;
     reader->read(&n_terms, sizeof(size_t), 1);
     if (n_terms > 0) {
-        term_ids_.resize(n_terms);
-        reader->read(term_ids_.data(), sizeof(term_t), n_terms);
-        term_ptr_.resize(n_terms + 1);
-        reader->read(term_ptr_.data(), sizeof(idx_t), n_terms + 1);
+        term_ids_ = io_align::read_padded<term_t>(reader, n_terms);
+        term_ptr_ = io_align::read_padded<idx_t>(reader, n_terms + 1);
+    } else {
+        term_ids_ = {};
+        term_ptr_ = {};
     }
     size_t nnz = 0;
     reader->read(&nnz, sizeof(size_t), 1);
-    if (nnz > 0) {
-        csc_cluster_.resize(nnz);
-        reader->read(csc_cluster_.data(), sizeof(cluster_id_t), nnz);
-        csc_value_.resize(nnz * element_size_);
-        reader->read(csc_value_.data(), sizeof(uint8_t), nnz * element_size_);
+    csc_cluster_ = io_align::read_padded<cluster_id_t>(reader, nnz);
+    csc_value_ =
+        io_align::read_padded<uint8_t>(reader, nnz * element_size_, element_size_);
+}
+
+void InvertedListClusters::mmap_deserialize(MmapCursor* cursor) {
+    throw_if_null(cursor, "cursor must not be null");
+
+    // Borrows each array where deserialize() copies it. read_array rejects a
+    // misaligned start, so the padding serialize() wrote is what makes this
+    // possible; borrow_array pairs the skip with the read.
+    auto borrow_array = [cursor](auto tag, size_t count, size_t alignment) {
+        using T = decltype(tag);
+        cursor->skip(io_align::padding_for(cursor->pos(), alignment));
+        return Buf<T>::borrow(cursor->read_array<T>(count), count);
+    };
+
+    const auto n_docs = cursor->read_scalar<size_t>();
+    docs_ = borrow_array(idx_t{}, n_docs, alignof(idx_t));
+    const auto n_offsets = cursor->read_scalar<size_t>();
+    offsets_ = borrow_array(idx_t{}, n_offsets, alignof(idx_t));
+
+    n_clusters_ = cursor->read_scalar<size_t>();
+    element_size_ = cursor->read_scalar<size_t>();
+    const auto n_terms = cursor->read_scalar<size_t>();
+    if (n_terms > 0) {
+        term_ids_ = borrow_array(term_t{}, n_terms, alignof(term_t));
+        term_ptr_ = borrow_array(idx_t{}, n_terms + 1, alignof(idx_t));
+    } else {
+        term_ids_ = {};
+        term_ptr_ = {};
+    }
+
+    const auto nnz = cursor->read_scalar<size_t>();
+    csc_cluster_ = borrow_array(cluster_id_t{}, nnz, alignof(cluster_id_t));
+    // Bytes on the wire, reinterpreted at element_size on read, so the borrow
+    // must start on that boundary rather than on 1.
+    csc_value_ =
+        borrow_array(uint8_t{}, nnz * element_size_, element_size_);
+    if (nnz > 0 && reinterpret_cast<uintptr_t>(csc_value_.data()) %
+                           element_size_ != 0) {
+        throw std::runtime_error(
+            "mmap: cluster summary values are misaligned for the element size");
     }
 }
 

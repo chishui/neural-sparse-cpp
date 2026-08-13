@@ -14,6 +14,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "nsparse/brutal_index.h"
@@ -41,6 +44,8 @@ public:
         delegate_.write(ptr, size, nitems);
     }
 
+    size_t pos() const override { return delegate_.pos(); }
+
     void close() override { closed_ = true; }
 
     const std::vector<uint8_t>& data() const { return delegate_.data(); }
@@ -64,6 +69,8 @@ public:
         }
         return delegate_.read(ptr, size, nitems);
     }
+
+    size_t pos() const override { return delegate_.pos(); }
 
     void close() override { closed_ = true; }
 
@@ -97,7 +104,7 @@ public:
         io_writer->write(test_string_.data(), sizeof(char), size);
     }
 
-    void read_index(nsparse::IOReader* io_reader) override {
+    void read_index(nsparse::IOReader* io_reader, int /*io_flags*/) override {
         io_reader->read(&test_data_, sizeof(int), 1);
         size_t size = 0;
         io_reader->read(&size, sizeof(size_t), 1);
@@ -367,8 +374,8 @@ TEST(IndexIO, StrictReaderThrowsAfterClose) {
 }
 
 // IDMapIndex wrapping SeismicIndex: write then read with strict IO.
-// Before the keep_open fix, write_index closed the stream before
-// IDMapIndex could write its id map, causing a write-after-close crash.
+// Before the keep_open fix, the delegate's write_index closed the stream out
+// from under IDMapIndex, causing a write-after-close crash.
 TEST(IndexIO, StrictIO_RoundtripIDMapSeismicIndex) {
     auto* seismic = new nsparse::SeismicIndex(128);
     auto* original = new nsparse::IDMapIndex(seismic);
@@ -396,9 +403,8 @@ TEST(IndexIO, StrictIO_RoundtripIDMapSeismicIndex) {
 }
 
 // IDMapIndex wrapping InvertedIndex: the original segfault scenario.
-// InvertedIndex has a non-trivial write_index/read_index, so the
-// stream must stay open for IDMapIndex to write/read its id map after
-// the delegate is serialized.
+// InvertedIndex has a non-trivial write_index/read_index, so the stream must
+// stay open for the delegate to be serialized after IDMapIndex's id map.
 // Note: InvertedIndex::get_vectors() returns nullptr after build()
 // (vectors_ is consumed to create inverted_lists_), so num_vectors()
 // returns 0. We verify the roundtrip by checking the index type instead.
@@ -453,4 +459,95 @@ TEST(IndexIO, StrictIO_RoundtripIDMapSeismicSQIndex) {
 
     delete original;
     delete loaded;
+}
+
+namespace {
+// Index file removed on destruction. read_index/write_index take char*, not
+// const char*, hence the owned string.
+class TempIndexFile {
+public:
+    explicit TempIndexFile(const std::string& name)
+        : path_(std::filesystem::temp_directory_path() / name) {
+        std::filesystem::remove(path_);
+    }
+    ~TempIndexFile() { std::filesystem::remove(path_); }
+
+    TempIndexFile(const TempIndexFile&) = delete;
+    TempIndexFile& operator=(const TempIndexFile&) = delete;
+
+    char* c_str() { return path_str_.data(); }
+
+private:
+    std::filesystem::path path_{};
+    std::string path_str_ = path_.string();
+};
+}  // namespace
+
+// Only the seismic index can be mapped, so kUseMmap on any other type has to
+// fall back to the copying read rather than be honoured.
+TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
+    TempIndexFile file("nsparse_index_io_sq_mmap_flag.idx");
+    nsparse::SeismicScalarQuantizedIndex original(128);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    original.add(2, indptr.data(), indices.data(), values.data());
+    nsparse::write_index(&original, file.c_str());
+
+    std::unique_ptr<nsparse::Index> loaded(
+        nsparse::read_index(file.c_str(), nsparse::IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->id(), original.id());
+    ASSERT_EQ(loaded->num_vectors(), 2);
+}
+
+// The id map is serialized ahead of the delegate so that a mapped delegate read
+// -- which consumes the rest of the file and hands back a fresh index -- has
+// nothing left behind it to parse. Mapping is only reachable if read_index
+// forwards its io_flags down to the wrapped index.
+TEST(IndexIO, UseMmapFlagReachesTheIDMapDelegate) {
+    TempIndexFile file("nsparse_index_io_idmap_mmap.idx");
+    auto* seismic =
+        new nsparse::SeismicIndex(5, {.lambda = 10, .beta = 2, .alpha = 0.5F});
+    nsparse::IDMapIndex original(seismic);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original.add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                          ids.data());
+    original.build();
+    nsparse::write_index(&original, file.c_str());
+
+    std::unique_ptr<nsparse::Index> loaded(
+        nsparse::read_index(file.c_str(), nsparse::IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->id(), original.id());
+    ASSERT_EQ(loaded->num_vectors(), 2);
+
+    // A borrowed CSR keeps the file's contiguity: indices sit right after
+    // indptr, which holds for the mapping but not for separate allocations.
+    const auto* vectors = loaded->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    const auto* indptr_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indptr_data());
+    const auto* indices_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indices_data());
+    EXPECT_EQ(indices_bytes - indptr_bytes,
+              static_cast<ptrdiff_t>((vectors->num_vectors() + 1) *
+                                     sizeof(nsparse::idx_t)));
+
+    // The id map still round-trips: search returns external ids, not internal.
+    std::vector<nsparse::idx_t> q_indptr = {0, 1};
+    std::vector<nsparse::term_t> q_indices = {0};
+    std::vector<float> q_values = {1.0F};
+    std::vector<nsparse::idx_t> labels(1, nsparse::INVALID_IDX);
+    std::vector<float> distances(1, -1.0F);
+    loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
+                   distances.data(), labels.data());
+    EXPECT_EQ(labels[0], 100);
 }
