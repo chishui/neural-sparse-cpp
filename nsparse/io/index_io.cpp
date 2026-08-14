@@ -10,7 +10,7 @@
 #include "nsparse/io/index_io.h"
 
 #include <cstdint>
-#include <functional>
+#include <memory>
 #include <stdexcept>
 
 #include "nsparse/brutal_index.h"
@@ -29,14 +29,45 @@ constexpr uint32_t SESQ = fourcc(SeismicScalarQuantizedIndex::name);
 constexpr uint32_t IDMP = fourcc(IDMapIndex::name);
 constexpr uint32_t INVT = fourcc(InvertedIndex::name);
 
-// Closed here rather than in a scope guard: close() reports flush/fclose
-// failures by throwing, which a destructor cannot forward.
+// Closes a stream once, on whichever path leaves the scope.
+//
+// close() reports a failed flush/fclose by throwing, so it cannot live in a
+// destructor alone. The explicit close() forwards that failure; the destructor
+// covers unwinding and swallows it, the in-flight exception being the one the
+// caller needs. `keep_open` leaves a nested index's stream to its enclosing
+// writer.
 template <class T>
-void close_stream(T* stream, bool keep_open) {
-    if (!keep_open) {
-        stream->close();
+class StreamCloser {
+public:
+    StreamCloser(T* stream, bool keep_open)
+        : stream_(keep_open ? nullptr : stream) {}
+
+    ~StreamCloser() {
+        if (stream_ == nullptr) {
+            return;
+        }
+        try {
+            stream_->close();
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
     }
-}
+
+    StreamCloser(const StreamCloser&) = delete;
+    StreamCloser& operator=(const StreamCloser&) = delete;
+    StreamCloser(StreamCloser&&) = delete;
+    StreamCloser& operator=(StreamCloser&&) = delete;
+
+    void close() {
+        T* stream = stream_;
+        stream_ = nullptr;
+        if (stream != nullptr) {
+            stream->close();
+        }
+    }
+
+private:
+    T* stream_;
+};
 
 void write_header(Index* index, IOWriter* io_writer) {
     // write index type
@@ -72,22 +103,22 @@ Index* read_header(IOReader* io_reader) {
 namespace detail {
 void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     auto* index_io = dynamic_cast<IndexIO*>(index);
-    auto auto_close = [keep_open](auto* stream) { close_stream(stream, keep_open); };
-    auto io_writer_ptr = std::unique_ptr<IOWriter, decltype(auto_close)>(io_writer, auto_close);
+    StreamCloser closer(io_writer, keep_open);
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
     // write header
-    write_header(index, io_writer_ptr.get());
+    write_header(index, io_writer);
     // write index customized payload
-    index_io->write_index(io_writer_ptr.get());
+    index_io->write_index(io_writer);
+    closer.close();
 }
 
 Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
-    auto auto_close = [keep_open](auto* stream) { close_stream(stream, keep_open); };
-    std::unique_ptr<IOReader, decltype(auto_close)> io_reader_ptr(io_reader, auto_close);
-    Index* index = read_header(io_reader_ptr.get());
-    auto* index_io = dynamic_cast<IndexIO*>(index);
+    StreamCloser closer(io_reader, keep_open);
+    // Held so it does not leak if anything below throws, close() included.
+    std::unique_ptr<Index> index(read_header(io_reader));
+    auto* index_io = dynamic_cast<IndexIO*>(index.get());
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
@@ -98,15 +129,17 @@ Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
         if (auto* file_io_reader = dynamic_cast<FileIOReader*>(io_reader)) {
             int dimension = index->get_dimension();
             // Where the payload starts, which is what serialize() padded against.
-            size_t pos = io_reader_ptr->pos();
-            delete index;
-            io_reader_ptr.reset();
+            size_t pos = io_reader->pos();
+            index.reset();
+            // The mapping takes its own handle.
+            closer.close();
             return SeismicIndex::mmap_index(dimension, file_io_reader->file_name().c_str(), pos);
         }
     }
 
-    index_io->read_index(io_reader_ptr.get(), io_flags);
-    return index;
+    index_io->read_index(io_reader, io_flags);
+    closer.close();
+    return index.release();
 }
 }  // namespace detail
 

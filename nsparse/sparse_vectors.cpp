@@ -217,21 +217,16 @@ void SparseVectors::serialize(IOWriter* io_writer) const {
         // so indptr needs none in practice, but the layout should not depend on
         // that.
         size_t indptr_size = vector_count + 1;
-        io_align::pad_to(io_writer, alignof(idx_t));
-        io_writer->write(const_cast<idx_t*>(indptr_.data()), sizeof(idx_t),
-                         indptr_size);
+        io_align::write_padded(io_writer, indptr_.data(), indptr_size);
 
         size_t indices_size = indptr_[vector_count];
-        io_align::pad_to(io_writer, alignof(term_t));
-        io_writer->write(const_cast<term_t*>(indices_.data()), sizeof(term_t),
-                         indices_size);
+        io_align::write_padded(io_writer, indices_.data(), indices_size);
 
         // Values are bytes on the wire but reinterpreted as element_size-wide
         // words on read, so they are padded to that width, not to 1.
-        size_t value_size = indptr_[vector_count] * element_size;
-        io_align::pad_to(io_writer, element_size);
-        io_writer->write(const_cast<uint8_t*>(values_.data()), sizeof(uint8_t),
-                         value_size);
+        size_t value_size = indices_size * element_size;
+        io_align::write_padded(io_writer, values_.data(), value_size,
+                               element_size);
     }
 }
 
@@ -252,7 +247,7 @@ void SparseVectors::deserialize(IOReader* io_reader) {
         size_t indices_size = indptr_[vector_count];
         indices_ = io_align::read_padded<term_t>(io_reader, indices_size);
 
-        size_t value_size = indices_size * element_size;
+        size_t value_size = checked_mul(indices_size, element_size);
         values_ = io_align::read_padded<uint8_t>(io_reader, value_size, element_size);
     }
 }
@@ -270,16 +265,21 @@ void SparseVectors::mmap_deserialize(MmapCursor* cursor) {
     const auto dimension = cursor->read_scalar<size_t>();
     const auto element_size = cursor->read_scalar<size_t>();
 
+    // SIZE_MAX vectors wrap this to an empty indptr, and its borrow is the null
+    // pointer the row-count read below would dereference.
     const size_t indptr_size = vector_count + 1;
-    cursor->skip(io_align::padding_for(cursor->pos(), alignof(idx_t)));
+    if (indptr_size == 0) {
+        throw std::runtime_error("mmap: implausible vector count in index file");
+    }
+    io_align::skip_padding(cursor, alignof(idx_t));
     const idx_t* indptr = cursor->read_array<idx_t>(indptr_size);
 
     const auto indices_size = static_cast<size_t>(indptr[vector_count]);
-    cursor->skip(io_align::padding_for(cursor->pos(), alignof(term_t)));
+    io_align::skip_padding(cursor, alignof(term_t));
     const term_t* indices = cursor->read_array<term_t>(indices_size);
 
-    const size_t value_size = indices_size * element_size;
-    cursor->skip(io_align::padding_for(cursor->pos(), element_size));
+    const size_t value_size = checked_mul(indices_size, element_size);
+    io_align::skip_padding(cursor, element_size);
     const uint8_t* values = cursor->read_array<uint8_t>(value_size);
 
     // map_vectors validates before borrowing, so a corrupt file throws here

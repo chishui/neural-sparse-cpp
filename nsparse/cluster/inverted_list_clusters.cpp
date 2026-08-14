@@ -335,17 +335,10 @@ void InvertedListClusters::serialize(IOWriter* writer) const {
     // reader can borrow it in place; see io/align.h.
     size_t n_docs = docs_.size();
     writer->write(&n_docs, sizeof(size_t), 1);
-    if (n_docs > 0) {
-        io_align::pad_to(writer, alignof(idx_t));
-        writer->write(const_cast<idx_t*>(docs_.data()), sizeof(idx_t), n_docs);
-    }
+    io_align::write_padded(writer, docs_.data(), n_docs);
     size_t n_offsets = offsets_.size();
     writer->write(&n_offsets, sizeof(size_t), 1);
-    if (n_offsets > 0) {
-        io_align::pad_to(writer, alignof(idx_t));
-        writer->write(const_cast<idx_t*>(offsets_.data()), sizeof(idx_t),
-                      n_offsets);
-    }
+    io_align::write_padded(writer, offsets_.data(), n_offsets);
 
     // Transposed (CSC) summary store.
     size_t n_clusters = n_clusters_;
@@ -355,27 +348,18 @@ void InvertedListClusters::serialize(IOWriter* writer) const {
     size_t n_terms = term_ids_.size();
     writer->write(&n_terms, sizeof(size_t), 1);
     if (n_terms > 0) {
-        io_align::pad_to(writer, alignof(term_t));
-        writer->write(const_cast<term_t*>(term_ids_.data()), sizeof(term_t),
-                      n_terms);
+        io_align::write_padded(writer, term_ids_.data(), n_terms);
         // term_ids_ is 2 bytes wide, so an odd term count leaves this 4-byte
         // array off its boundary without the pad.
-        io_align::pad_to(writer, alignof(idx_t));
-        writer->write(const_cast<idx_t*>(term_ptr_.data()), sizeof(idx_t),
-                      n_terms + 1);
+        io_align::write_padded(writer, term_ptr_.data(), n_terms + 1);
     }
     size_t nnz = csc_cluster_.size();
     writer->write(&nnz, sizeof(size_t), 1);
-    if (nnz > 0) {
-        io_align::pad_to(writer, alignof(cluster_id_t));
-        writer->write(const_cast<cluster_id_t*>(csc_cluster_.data()),
-                      sizeof(cluster_id_t), nnz);
-        // Values are bytes on the wire but reinterpreted as element_size-wide
-        // words on read, so they are padded to that width, not to 1.
-        io_align::pad_to(writer, element_size_);
-        writer->write(const_cast<uint8_t*>(csc_value_.data()), sizeof(uint8_t),
-                      nnz * element_size_);
-    }
+    io_align::write_padded(writer, csc_cluster_.data(), nnz);
+    // Values are bytes on the wire but reinterpreted as element_size-wide
+    // words on read, so they are padded to that width, not to 1.
+    io_align::write_padded(writer, csc_value_.data(), csc_value_.size(),
+                           element_size_);
 }
 
 void InvertedListClusters::deserialize(IOReader* reader) {
@@ -400,8 +384,8 @@ void InvertedListClusters::deserialize(IOReader* reader) {
     size_t nnz = 0;
     reader->read(&nnz, sizeof(size_t), 1);
     csc_cluster_ = io_align::read_padded<cluster_id_t>(reader, nnz);
-    csc_value_ =
-        io_align::read_padded<uint8_t>(reader, nnz * element_size_, element_size_);
+    csc_value_ = io_align::read_padded<uint8_t>(
+        reader, checked_mul(nnz, element_size_), element_size_);
 }
 
 void InvertedListClusters::mmap_deserialize(MmapCursor* cursor) {
@@ -409,35 +393,29 @@ void InvertedListClusters::mmap_deserialize(MmapCursor* cursor) {
 
     // Borrows each array where deserialize() copies it. read_array rejects a
     // misaligned start, so the padding serialize() wrote is what makes this
-    // possible; borrow_array pairs the skip with the read.
-    auto borrow_array = [cursor](auto tag, size_t count, size_t alignment) {
-        using T = decltype(tag);
-        cursor->skip(io_align::padding_for(cursor->pos(), alignment));
-        return Buf<T>::borrow(cursor->read_array<T>(count), count);
-    };
-
+    // possible; borrow_padded pairs the skip with the read.
     const auto n_docs = cursor->read_scalar<size_t>();
-    docs_ = borrow_array(idx_t{}, n_docs, alignof(idx_t));
+    docs_ = io_align::borrow_padded<idx_t>(cursor, n_docs);
     const auto n_offsets = cursor->read_scalar<size_t>();
-    offsets_ = borrow_array(idx_t{}, n_offsets, alignof(idx_t));
+    offsets_ = io_align::borrow_padded<idx_t>(cursor, n_offsets);
 
     n_clusters_ = cursor->read_scalar<size_t>();
     element_size_ = cursor->read_scalar<size_t>();
     const auto n_terms = cursor->read_scalar<size_t>();
     if (n_terms > 0) {
-        term_ids_ = borrow_array(term_t{}, n_terms, alignof(term_t));
-        term_ptr_ = borrow_array(idx_t{}, n_terms + 1, alignof(idx_t));
+        term_ids_ = io_align::borrow_padded<term_t>(cursor, n_terms);
+        term_ptr_ = io_align::borrow_padded<idx_t>(cursor, n_terms + 1);
     } else {
         term_ids_ = {};
         term_ptr_ = {};
     }
 
     const auto nnz = cursor->read_scalar<size_t>();
-    csc_cluster_ = borrow_array(cluster_id_t{}, nnz, alignof(cluster_id_t));
+    csc_cluster_ = io_align::borrow_padded<cluster_id_t>(cursor, nnz);
     // Bytes on the wire, reinterpreted at element_size on read, so the borrow
     // must start on that boundary rather than on 1.
-    csc_value_ =
-        borrow_array(uint8_t{}, nnz * element_size_, element_size_);
+    csc_value_ = io_align::borrow_padded<uint8_t>(
+        cursor, checked_mul(nnz, element_size_), element_size_);
     if (nnz > 0 && reinterpret_cast<uintptr_t>(csc_value_.data()) %
                            element_size_ != 0) {
         throw std::runtime_error(

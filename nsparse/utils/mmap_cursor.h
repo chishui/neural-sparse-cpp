@@ -52,7 +52,11 @@ public:
         if (n == 0) {
             return nullptr;
         }
-        ensure(n * sizeof(T));
+        // Divided rather than ensure(n * sizeof(T)): `n` comes from the file,
+        // and a wrapped product passes the bounds check.
+        if (n > remaining() / sizeof(T)) {
+            throw std::runtime_error("mmap: unexpected end of index file");
+        }
         const uint8_t* start = data_ + pos_;
         if (reinterpret_cast<uintptr_t>(start) % alignof(T) != 0) {
             throw std::runtime_error(
@@ -69,12 +73,14 @@ public:
         pos_ += bytes;
     }
 
-    size_t pos() const { return pos_; }
-    size_t remaining() const { return size_ - pos_; }
+    [[nodiscard]] size_t pos() const { return pos_; }
+    [[nodiscard]] size_t remaining() const { return size_ - pos_; }
 
 private:
+    // Subtraction, not `pos_ + bytes > size_`: `bytes` can come from the file
+    // and the sum would wrap. pos_ <= size_ always, so this cannot underflow.
     void ensure(size_t bytes) const {
-        if (pos_ + bytes > size_) {
+        if (bytes > size_ - pos_) {
             throw std::runtime_error("mmap: unexpected end of index file");
         }
     }

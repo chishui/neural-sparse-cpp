@@ -13,9 +13,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "nsparse/io/io.h"
 #include "nsparse/utils/buf.h"
+#include "nsparse/utils/mmap_cursor.h"
 
 // Alignment padding for serialized arrays.
 //
@@ -35,8 +37,13 @@ namespace nsparse::io_align {
 // single call can insert.
 constexpr size_t kMaxAlignment = 8;
 
-// Bytes to insert at `pos` to reach an `alignment` boundary.
+// Bytes to insert at `pos` to reach an `alignment` boundary. Zero is reachable
+// input, not a caller bug: the alignment can be an element width read from the
+// file, and `pos % 0` would trap rather than throw.
 constexpr size_t padding_for(size_t pos, size_t alignment) {
+    if (alignment == 0) {
+        throw std::runtime_error("index file declares a zero element width");
+    }
     return (alignment - pos % alignment) % alignment;
 }
 
@@ -58,17 +65,42 @@ inline void skip_padding(IOReader* reader, size_t alignment) {
     }
 }
 
-// read_owned, preceded by the padding pad_to() wrote. `alignment` defaults to
-// T's, but a byte array that is reinterpreted at a wider element size on read
-// needs that width passed instead.
+// Same, for the mapped reader.
+inline void skip_padding(MmapCursor* cursor, size_t alignment) {
+    cursor->skip(padding_for(cursor->pos(), alignment));
+}
+
+// The three below are the only way to move an aligned array on or off the wire.
+// They pad unconditionally, count == 0 included: an empty array must consume the
+// same bytes on both sides or every later offset shifts, and a `count > 0` guard
+// on the padding is what lets writer and reader disagree.
+//
+// `alignment` defaults to T's; a byte array reinterpreted at a wider element size
+// on read needs that width instead.
+
+template <class T>
+void write_padded(IOWriter* writer, const T* data, size_t count,
+                  size_t alignment = alignof(T)) {
+    pad_to(writer, alignment);
+    if (count > 0) {
+        writer->write(const_cast<T*>(data), sizeof(T), count);
+    }
+}
+
+// read_owned, preceded by the padding write_padded() wrote.
 template <class T>
 Buf<T> read_padded(IOReader* reader, size_t count,
                    size_t alignment = alignof(T)) {
-    if (count == 0) {
-        return {};
-    }
     skip_padding(reader, alignment);
     return read_owned<T>(reader, count);
+}
+
+// Borrows the array in place where read_padded() copies it.
+template <class T>
+Buf<T> borrow_padded(MmapCursor* cursor, size_t count,
+                     size_t alignment = alignof(T)) {
+    skip_padding(cursor, alignment);
+    return Buf<T>::borrow(cursor->read_array<T>(count), count);
 }
 
 }  // namespace nsparse::io_align

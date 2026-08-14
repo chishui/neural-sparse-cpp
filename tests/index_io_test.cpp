@@ -363,6 +363,45 @@ TEST(IndexIO, StrictWriterThrowsAfterClose) {
     ASSERT_THROW(writer.write(&val, sizeof(int), 1), std::runtime_error);
 }
 
+// FileIO*::close() reports a failed flush/fclose by throwing. Closing from a
+// destructor would turn that into a terminate, so the close has to sit on the
+// success path where the exception can propagate.
+TEST(IndexIO, WriteIndexPropagatesACloseFailure) {
+    class ThrowingCloseWriter : public StrictBufferedIOWriter {
+    public:
+        void close() override {
+            StrictBufferedIOWriter::close();
+            throw std::runtime_error("Failed to close file");
+        }
+    };
+
+    auto* index = new nsparse::SeismicIndex(8);
+    ThrowingCloseWriter writer;
+    ASSERT_THROW(nsparse::write_index(index, &writer), std::runtime_error);
+    delete index;
+}
+
+TEST(IndexIO, ReadIndexPropagatesACloseFailure) {
+    class ThrowingCloseReader : public StrictBufferedIOReader {
+    public:
+        explicit ThrowingCloseReader(const std::vector<uint8_t>& data)
+            : StrictBufferedIOReader(data) {}
+
+        void close() override {
+            StrictBufferedIOReader::close();
+            throw std::runtime_error("Failed to close file");
+        }
+    };
+
+    auto* original = new nsparse::SeismicIndex(8);
+    StrictBufferedIOWriter writer;
+    nsparse::write_index(original, &writer);
+    delete original;
+
+    ThrowingCloseReader reader(writer.data());
+    ASSERT_THROW(nsparse::read_index(&reader), std::runtime_error);
+}
+
 // Verify StrictBufferedIOReader throws on read after close
 TEST(IndexIO, StrictReaderThrowsAfterClose) {
     std::vector<uint8_t> buf(sizeof(int), 0);

@@ -20,6 +20,7 @@
 
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/mmap_cursor.h"
 
 namespace {
 
@@ -761,4 +762,69 @@ TEST(SparseVectorsLayout, empty_vectors_write_only_the_count) {
     nsparse::SparseVectors empty;
 
     ASSERT_EQ(serialized(empty).size(), sizeof(size_t));
+}
+
+// U64 is where empty rows bite: the empty values array pads to 8 where the indptr
+// before it only reached a multiple of 4, so 4 bytes go in. A reader that skips
+// padding only for a non-empty array leaves them for the next payload to misread.
+TEST(SparseVectorsLayout, empty_rows_round_trip_at_a_wide_element_size) {
+    auto vectors = owned_vectors(4, nsparse::U64, {0, 0, 0}, {}, {});
+    ASSERT_EQ(vectors.num_vectors(), 2);
+
+    auto bytes = serialized(vectors);
+    const size_t vectors_bytes = bytes.size();
+    ASSERT_EQ(vectors_bytes % alignof(uint64_t), 0)
+        << "the values array must land on its element boundary";
+
+    const uint32_t marker = 0xFEEDFACE;
+    const auto* marker_bytes = reinterpret_cast<const uint8_t*>(&marker);
+    bytes.insert(bytes.end(), marker_bytes, marker_bytes + sizeof(marker));
+
+    nsparse::BufferedIOReader reader(bytes);
+    nsparse::SparseVectors loaded;
+    loaded.deserialize(&reader);
+
+    ASSERT_EQ(loaded.num_vectors(), 2);
+    ASSERT_EQ(reader.pos(), vectors_bytes);
+
+    uint32_t read_back = 0;
+    ASSERT_EQ(reader.read(&read_back, sizeof(read_back), 1), 1);
+    ASSERT_EQ(read_back, marker);
+}
+
+// The two readers must agree on where an enclosing index's payload begins.
+TEST(SparseVectorsLayout, mapped_and_copied_reads_consume_the_same_bytes) {
+    auto vectors = owned_vectors(4, nsparse::U64, {0, 0, 0}, {}, {});
+    const auto bytes = serialized(vectors);
+
+    nsparse::BufferedIOReader reader(bytes);
+    nsparse::SparseVectors copied;
+    copied.deserialize(&reader);
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size());
+    nsparse::SparseVectors mapped;
+    mapped.mmap_deserialize(&cursor);
+
+    ASSERT_EQ(cursor.pos(), reader.pos());
+    ASSERT_EQ(cursor.pos(), bytes.size());
+}
+
+// element_size reaches padding_for() as an alignment, where zero used to trap
+// rather than throw. Both readers have to reject it the same way.
+TEST(SparseVectorsLayout, rejects_a_zero_element_width) {
+    auto vectors = owned_vectors(4, nsparse::U32, {0, 2}, {0, 1},
+                                 std::vector<uint8_t>(2 * sizeof(float), 0));
+    auto bytes = serialized(vectors);
+
+    const size_t element_size_offset = 2 * sizeof(size_t);
+    const size_t zero = 0;
+    std::memcpy(bytes.data() + element_size_offset, &zero, sizeof(zero));
+
+    nsparse::BufferedIOReader reader(bytes);
+    nsparse::SparseVectors copied;
+    ASSERT_THROW(copied.deserialize(&reader), std::runtime_error);
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size());
+    nsparse::SparseVectors mapped;
+    ASSERT_THROW(mapped.mmap_deserialize(&cursor), std::runtime_error);
 }

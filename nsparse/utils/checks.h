@@ -10,6 +10,8 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <cstddef>
+#include <limits>
 #include <stdexcept>
 
 namespace nsparse {
@@ -67,6 +69,16 @@ void throw_if_any_non_null(const char* msg, Args*... ptrs) {
 template <typename... Args>
 void throw_if_any_non_null(Args*... ptrs) {
     throw_if_any_non_null("pointer cannot be reassigned", ptrs...);
+}
+
+// Rejects a product that would wrap: counts and widths read from an index file
+// are multiplied to size an array, and a wrapped size passes bounds checks.
+inline size_t checked_mul(size_t lhs, size_t rhs,
+                          const char* msg = "size overflow in index file") {
+    if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
+        throw std::runtime_error(msg);
+    }
+    return lhs * rhs;
 }
 
 }  // namespace nsparse
