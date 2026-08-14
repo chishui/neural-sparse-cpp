@@ -380,7 +380,7 @@ void InvertedIndex::write_index(IOWriter* io_writer) {
     }
 }
 
-void InvertedIndex::read_index(IOReader* io_reader) {
+void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
     // Read inverted lists
     size_t n_terms = 0;
     io_reader->read(&n_terms, sizeof(size_t), 1);

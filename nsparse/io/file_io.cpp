@@ -15,11 +15,12 @@
 
 namespace nsparse {
 
-FileIOReader::FileIOReader(char* filename) : file_(nullptr) {
-    file_ = fopen(filename, "rb");
+FileIOReader::FileIOReader(char* file_name) : file_(nullptr) {
+    file_ = fopen(file_name, "rb");
     if (file_ == nullptr) {
         throw std::runtime_error("Failed to open file for reading");
     }
+    file_name_ = std::string(file_name);
 }
 
 FileIOReader::FileIOReader(FILE* file) : file_(file) {}
@@ -41,7 +42,9 @@ void FileIOReader::close() {
 }
 
 size_t FileIOReader::read(void* ptr, size_t size, size_t nitems) {
-    return fread(ptr, size, nitems, file_);
+    const size_t read_items = fread(ptr, size, nitems, file_);
+    pos_ += read_items * size;
+    return read_items;
 }
 
 FileIOWriter::FileIOWriter(char* filename) : file_(nullptr) {
@@ -74,5 +77,6 @@ void FileIOWriter::write(void* ptr, size_t size, size_t nitems) {
     if (written != nitems) {
         throw std::runtime_error("Failed to write to file");
     }
+    pos_ += written * size;
 }
 }  // namespace nsparse

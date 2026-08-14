@@ -23,6 +23,8 @@ public:
 
     void write(void* ptr, size_t size, size_t nitems) override;
 
+    size_t pos() const override { return buffer_.size(); }
+
     // Get the written data
     const std::vector<uint8_t>& data() const { return buffer_; }
 
@@ -46,6 +48,8 @@ public:
     BufferedIOReader(const uint8_t* data, size_t size);
 
     size_t read(void* ptr, size_t size, size_t nitems) override;
+
+    size_t pos() const override { return pos_; }
 
     size_t remaining() const { return size_ - pos_; }
 

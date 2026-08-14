@@ -29,6 +29,7 @@
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
 #include "nsparse/utils/distance_simd.h"
+#include "nsparse/utils/mmap_file.h"
 #include "nsparse/utils/prefetch.h"
 #include "nsparse/utils/ranker.h"
 #include "nsparse/utils/vector_process.h"
@@ -109,9 +110,10 @@ void query_single_inverted_list(
 }  // namespace
 
 SeismicIndex::SeismicIndex(int dim)
-    : Index(dim), cluster_parameter_(detail::kDefaultSeismicClusterParams) {}
+    : MmapIndex(dim),
+      cluster_parameter_(detail::kDefaultSeismicClusterParams) {}
 SeismicIndex::SeismicIndex(int dim, SeismicClusterParameters parameter)
-    : Index(dim), cluster_parameter_(parameter) {}
+    : MmapIndex(dim), cluster_parameter_(parameter) {}
 
 void SeismicIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
                        const float* values) {
@@ -132,7 +134,7 @@ void SeismicIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
 
 void SeismicIndex::build() {
     clustered_inverted_lists = std::move(detail::build_inverted_lists_clusters(
-        vectors_.get(),
+        get_vectors(),
         {.element_size = kElementSize,
          .dimension = static_cast<size_t>(get_dimension())},
         cluster_parameter_));
@@ -152,12 +154,6 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
         search_parameters != nullptr
             ? dynamic_cast<const SeismicSearchParameters*>(search_parameters)
             : &default_params;
-
-    // The input batch CSR (indptr/indices/values) is already absolute-indexed,
-    // so we index it directly in the common (no-filter) path — no need to
-    // re-materialize a SparseVectors or copy its arrays. Only the exact-match
-    // id-selector fast path still needs a SparseVectors view, so build one
-    // lazily just for that case.
     if (search_parameters != nullptr) {
         const IDSelector* sel = search_parameters->get_id_selector();
         // should_run_exact_match ignores its queries arg (only inspects the
@@ -172,7 +168,7 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
                                       reinterpret_cast<const uint8_t*>(values),
                                       nnz * kElementSize);
             return detail::ExactMatcher::search(
-                vectors_.get(), dynamic_cast<const IDSelectorEnumerable*>(sel),
+                get_vectors(), dynamic_cast<const IDSelectorEnumerable*>(sel),
                 &query_vectors, kElementSize, k);
         }
     }
@@ -265,10 +261,6 @@ auto SeismicIndex::single_query(std::vector<float>& dense,
     return {scores, ids};
 }
 
-const SparseVectors* SeismicIndex::get_vectors() const {
-    return vectors_.get();
-}
-
 void SeismicIndex::write_index(IOWriter* io_writer) {
     // write vectors
     if (vectors_ == nullptr) {
@@ -280,14 +272,45 @@ void SeismicIndex::write_index(IOWriter* io_writer) {
     inv_list_writer.serialize(io_writer);
 }
 
-void SeismicIndex::read_index(IOReader* io_reader) {
+void SeismicIndex::read_index(IOReader* io_reader, int io_flags) {
+    // read vectors
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
     if (tmp_vectors.num_vectors() > 0) {
         vectors_ = std::make_unique<SparseVectors>(std::move(tmp_vectors));
     }
-    SeismicInvertedListsWriter inv_list_writer({});
+    SeismicInvertedListsWriter inv_list_writer;
     inv_list_writer.deserialize(io_reader);
     clustered_inverted_lists = std::move(inv_list_writer.release());
+}
+
+SeismicIndex* SeismicIndex::mmap_index(int dimension, const char* index_file,
+                                       size_t pos) {
+    throw_if_null(index_file, "index_file must not be null");
+    auto index = std::make_unique<SeismicIndex>(dimension);
+
+    MmapFile mmap_file(std::string{index_file});
+    // `pos` is where write_index's payload begins, past the header read_header
+    // consumed. Absolute file offsets are what serialize() padded against, so
+    // the cursor has to start at 0 and skip rather than map from `pos`.
+    MmapCursor cursor(mmap_file.data(), mmap_file.size());
+    cursor.skip(pos);
+
+    // Same order write_index wrote them.
+    auto vectors = std::make_unique<SparseVectors>();
+    vectors->mmap_deserialize(&cursor);
+
+    SeismicInvertedListsWriter inv_list_writer;
+    inv_list_writer.mmap_deserialize(&cursor);
+
+    // Committed only once everything parsed, so a corrupt file cannot leave a
+    // half-mapped index behind. mapped_file_ last: the arrays above borrow from
+    // it, and moving it does not move the mapping itself.
+    index->clustered_inverted_lists = std::move(inv_list_writer.release());
+    if (vectors->num_vectors() > 0) {
+        index->vectors_ = std::move(vectors);
+    }
+    index->mapped_file_ = std::move(mmap_file);
+    return index.release();
 }
 }  // namespace nsparse

@@ -11,12 +11,15 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/distance.h"
+#include "nsparse/utils/mmap_cursor.h"
 
 namespace {
 
@@ -143,20 +146,24 @@ TEST(InvertedListClusters, constructor_with_empty_cluster) {
     ASSERT_EQ(doc_span2.size(), 1);
 }
 
-// Copy constructor tests
-TEST(InvertedListClusters, copy_constructor_without_summaries) {
+// Move tests. The type is move-only: its arrays are Buf, which may borrow memory
+// it does not own, so copying is deleted rather than silently deep-copying.
+static_assert(!std::is_copy_constructible_v<nsparse::InvertedListClusters>);
+static_assert(!std::is_copy_assignable_v<nsparse::InvertedListClusters>);
+
+TEST(InvertedListClusters, move_constructor_without_summaries) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2, 3}};
     nsparse::InvertedListClusters original(docs);
 
-    nsparse::InvertedListClusters copy(original);
+    nsparse::InvertedListClusters moved(std::move(original));
 
-    auto doc_span = copy.get_docs(0);
+    auto doc_span = moved.get_docs(0);
     ASSERT_EQ(doc_span.size(), 2);
     ASSERT_EQ(doc_span[0], 0);
     ASSERT_EQ(doc_span[1], 1);
 }
 
-TEST(InvertedListClusters, copy_constructor_with_summaries) {
+TEST(InvertedListClusters, move_constructor_with_summaries) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2}};
     nsparse::InvertedListClusters original(docs);
 
@@ -164,38 +171,43 @@ TEST(InvertedListClusters, copy_constructor_with_summaries) {
         {{0, 1}, {0, 2}, {1, 2}}, {{1.0F, 2.0F}, {1.5F, 1.0F}, {3.0F, 2.0F}});
     original.summarize(&vectors, 1.0F);
 
-    nsparse::InvertedListClusters copy(original);
+    nsparse::InvertedListClusters moved(std::move(original));
 
-    ASSERT_EQ(copy.cluster_size(), 2);
-    // The copy must carry a working transpose: cluster 0 has term 0, cluster 1
-    // has term 2 (both with max value 1.5 across their docs' overlapping term).
-    auto term0 = summary_values_at_term<float>(copy, 0);
+    ASSERT_EQ(moved.cluster_size(), 2);
+    // The transpose must survive the move intact: cluster 0 has term 0, cluster
+    // 1 has term 2.
+    auto term0 = summary_values_at_term<float>(moved, 0);
     ASSERT_EQ(term0.size(), 2U);
     ASSERT_GT(term0[0], 0.0F);
 }
 
-// Copy assignment tests
-TEST(InvertedListClusters, copy_assignment_without_summaries) {
+TEST(InvertedListClusters, move_assignment_without_summaries) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2, 3}};
     nsparse::InvertedListClusters original(docs);
 
-    nsparse::InvertedListClusters copy;
-    copy = original;
+    nsparse::InvertedListClusters moved;
+    moved = std::move(original);
 
-    auto doc_span = copy.get_docs(1);
+    auto doc_span = moved.get_docs(1);
     ASSERT_EQ(doc_span.size(), 2);
     ASSERT_EQ(doc_span[0], 2);
     ASSERT_EQ(doc_span[1], 3);
 }
 
-TEST(InvertedListClusters, copy_assignment_self) {
-    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}};
-    nsparse::InvertedListClusters clusters(docs);
+// Move-assigning over a populated instance must release what it held rather than
+// leak it, and take on the source's contents.
+TEST(InvertedListClusters, move_assignment_over_populated) {
+    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2, 3}};
+    nsparse::InvertedListClusters original(docs);
 
-    clusters = clusters;
+    std::vector<std::vector<nsparse::idx_t>> other_docs = {{7, 8, 9}};
+    nsparse::InvertedListClusters target(other_docs);
+    target = std::move(original);
 
-    auto doc_span = clusters.get_docs(0);
+    auto doc_span = target.get_docs(0);
     ASSERT_EQ(doc_span.size(), 2);
+    ASSERT_EQ(doc_span[0], 0);
+    ASSERT_EQ(doc_span[1], 1);
 }
 
 // Summarize tests
@@ -463,4 +475,118 @@ TEST(InvertedListClusters, transposed_scoring_matches_reference) {
                 << "query " << q << ", cluster " << c;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The serialized layout, walked by both readers.
+//
+// What is covered is that the two agree, not that either is defensive: neither
+// checks what it reads past the bounds of the mapping, so a self-inconsistent
+// file is read out of bounds at search time. Deliberate -- scanning the summaries
+// to rule it out costs more than the mapped load itself.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Lays out a payload field by field, so a test can plant a value serialize()
+// would never produce. Padding runs off the position within the payload, where
+// both readers start.
+class ClusterPayload {
+public:
+    ClusterPayload& scalar(size_t value) {
+        return append(&value, sizeof(value));
+    }
+
+    template <class T>
+    ClusterPayload& array(const std::vector<T>& values) {
+        return pad(alignof(T)).append(values.data(), values.size() * sizeof(T));
+    }
+
+    // Reinterpreted `width` at a time on read, so padded to that, not to 1.
+    ClusterPayload& values(const std::vector<uint8_t>& bytes, size_t width) {
+        return pad(width).append(bytes.data(), bytes.size());
+    }
+
+    [[nodiscard]] const std::vector<uint8_t>& data() const { return bytes_; }
+
+private:
+    // A zero alignment inserts nothing, as a file claiming a zero element width
+    // would. The reader still has to reject the width, not modulo by it.
+    ClusterPayload& pad(size_t alignment) {
+        while (alignment != 0 && bytes_.size() % alignment != 0) {
+            bytes_.push_back(0);
+        }
+        return *this;
+    }
+
+    ClusterPayload& append(const void* src, size_t count) {
+        const auto* first = static_cast<const uint8_t*>(src);
+        bytes_.insert(bytes_.end(), first, first + count);
+        return *this;
+    }
+
+    std::vector<uint8_t> bytes_;
+};
+
+// Mirrors InvertedListClusters::cluster_id_t, which is private.
+using stored_cluster_id_t = uint16_t;
+
+// One cluster over two docs, one summary term, one entry. Parameterized so a test
+// can make exactly one field inconsistent.
+ClusterPayload well_formed_payload(
+    size_t n_clusters = 1, size_t element_size = nsparse::U32,
+    const std::vector<nsparse::idx_t>& offsets = {0, 2},
+    const std::vector<nsparse::term_t>& term_ids = {5},
+    const std::vector<nsparse::idx_t>& term_ptr = {0, 1},
+    const std::vector<stored_cluster_id_t>& csc_cluster = {0}) {
+    ClusterPayload payload;
+    payload.scalar(2).array<nsparse::idx_t>({0, 1});
+    payload.scalar(offsets.size()).array(offsets);
+    payload.scalar(n_clusters);
+    payload.scalar(element_size);
+    payload.scalar(term_ids.size());
+    if (!term_ids.empty()) {
+        payload.array(term_ids).array(term_ptr);
+    }
+    payload.scalar(csc_cluster.size()).array(csc_cluster);
+    payload.values(std::vector<uint8_t>(csc_cluster.size() * element_size, 1),
+                   element_size);
+    return payload;
+}
+
+// Both paths walk one layout, so a check missing from either is a hole.
+void expect_both_readers_reject(const ClusterPayload& payload) {
+    nsparse::BufferedIOReader reader(payload.data());
+    nsparse::InvertedListClusters copied;
+    EXPECT_THROW(copied.deserialize(&reader), std::runtime_error);
+
+    nsparse::MmapCursor cursor(payload.data().data(), payload.data().size());
+    nsparse::InvertedListClusters mapped;
+    EXPECT_THROW(mapped.mmap_deserialize(&cursor), std::runtime_error);
+}
+
+}  // namespace
+
+// Both readers consume a hand-built payload and land on the same byte.
+TEST(InvertedListClustersLayout, accepts_a_well_formed_payload) {
+    const auto payload = well_formed_payload();
+
+    nsparse::BufferedIOReader reader(payload.data());
+    nsparse::InvertedListClusters copied;
+    ASSERT_NO_THROW(copied.deserialize(&reader));
+    ASSERT_EQ(copied.cluster_size(), 1);
+    ASSERT_EQ(reader.pos(), payload.data().size());
+
+    nsparse::MmapCursor cursor(payload.data().data(), payload.data().size());
+    nsparse::InvertedListClusters mapped;
+    ASSERT_NO_THROW(mapped.mmap_deserialize(&cursor));
+    ASSERT_EQ(mapped.cluster_size(), 1);
+    ASSERT_EQ(cursor.pos(), payload.data().size());
+}
+
+// Reaches padding_for() as an alignment, which used to divide by zero on the
+// mapped path while the copying path skipped the padding entirely.
+TEST(InvertedListClustersLayout, rejects_a_zero_element_width) {
+    expect_both_readers_reject(well_formed_payload(
+        /*n_clusters=*/1, /*element_size=*/0, {0, 2}, {5}, {0, 1}, {0}));
 }

@@ -9,6 +9,8 @@
 
 #include "nsparse/io/index_io.h"
 
+#include <cstdint>
+#include <memory>
 #include <stdexcept>
 
 #include "nsparse/brutal_index.h"
@@ -26,6 +28,46 @@ constexpr uint32_t SEIS = fourcc(SeismicIndex::name);
 constexpr uint32_t SESQ = fourcc(SeismicScalarQuantizedIndex::name);
 constexpr uint32_t IDMP = fourcc(IDMapIndex::name);
 constexpr uint32_t INVT = fourcc(InvertedIndex::name);
+
+// Closes a stream once, on whichever path leaves the scope.
+//
+// close() reports a failed flush/fclose by throwing, so it cannot live in a
+// destructor alone. The explicit close() forwards that failure; the destructor
+// covers unwinding and swallows it, the in-flight exception being the one the
+// caller needs. `keep_open` leaves a nested index's stream to its enclosing
+// writer.
+template <class T>
+class StreamCloser {
+public:
+    StreamCloser(T* stream, bool keep_open)
+        : stream_(keep_open ? nullptr : stream) {}
+
+    ~StreamCloser() {
+        if (stream_ == nullptr) {
+            return;
+        }
+        try {
+            stream_->close();
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+    }
+
+    StreamCloser(const StreamCloser&) = delete;
+    StreamCloser& operator=(const StreamCloser&) = delete;
+    StreamCloser(StreamCloser&&) = delete;
+    StreamCloser& operator=(StreamCloser&&) = delete;
+
+    void close() {
+        T* stream = stream_;
+        stream_ = nullptr;
+        if (stream != nullptr) {
+            stream->close();
+        }
+    }
+
+private:
+    T* stream_;
+};
 
 void write_header(Index* index, IOWriter* io_writer) {
     // write index type
@@ -61,6 +103,7 @@ Index* read_header(IOReader* io_reader) {
 namespace detail {
 void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     auto* index_io = dynamic_cast<IndexIO*>(index);
+    StreamCloser closer(io_writer, keep_open);
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
@@ -68,22 +111,35 @@ void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     write_header(index, io_writer);
     // write index customized payload
     index_io->write_index(io_writer);
-    if (!keep_open) {
-        io_writer->close();
-    }
+    closer.close();
 }
 
-Index* read_index(IOReader* io_reader, bool keep_open) {
-    Index* index = read_header(io_reader);
-    auto* index_io = dynamic_cast<IndexIO*>(index);
+Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
+    StreamCloser closer(io_reader, keep_open);
+    // Held so it does not leak if anything below throws, close() included.
+    std::unique_ptr<Index> index(read_header(io_reader));
+    auto* index_io = dynamic_cast<IndexIO*>(index.get());
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
-    index_io->read_index(io_reader);
-    if (!keep_open) {
-        io_reader->close();
+
+    // handle mmap
+    if (fourcc(index->id()) == SEIS &&
+        (io_flags & IndexIoFlag::kUseMmap) == IndexIoFlag::kUseMmap) {
+        if (auto* file_io_reader = dynamic_cast<FileIOReader*>(io_reader)) {
+            int dimension = index->get_dimension();
+            // Where the payload starts, which is what serialize() padded against.
+            size_t pos = io_reader->pos();
+            index.reset();
+            // The mapping takes its own handle.
+            closer.close();
+            return SeismicIndex::mmap_index(dimension, file_io_reader->file_name().c_str(), pos);
+        }
     }
-    return index;
+
+    index_io->read_index(io_reader, io_flags);
+    closer.close();
+    return index.release();
 }
 }  // namespace detail
 
@@ -91,17 +147,17 @@ void write_index(Index* index, IOWriter* io_writer) {
     detail::write_index(index, io_writer, false);
 }
 
-void write_index(Index* index, char* filename) {
-    FileIOWriter writer(filename);
+void write_index(Index* index, char* file_name) {
+    FileIOWriter writer(file_name);
     write_index(index, &writer);
 }
 
-Index* read_index(IOReader* io_reader) {
-    return detail::read_index(io_reader, false);
+Index* read_index(IOReader* io_reader, int io_flags) {
+    return detail::read_index(io_reader, false, io_flags);
 }
 
-Index* read_index(char* filename) {
-    FileIOReader reader(filename);
-    return read_index(&reader);
+Index* read_index(char* file_name, int io_flags) {
+    FileIOReader reader(file_name);
+    return read_index(&reader, io_flags);
 }
 }  // namespace nsparse

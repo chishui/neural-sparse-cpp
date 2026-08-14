@@ -13,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <vector>
+#include <string>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/cluster/random_kmeans.h"
@@ -23,10 +24,18 @@
 #include "nsparse/utils/distance_simd.h"
 
 namespace nsparse {
+
+struct BatchClusteringOption {
+    size_t batch_size = 1;
+    std::string batch_file_output_path;
+};
+
 struct SeismicClusterParameters {
     int lambda;
     int beta;
     float alpha;
+    int inverted_list_batch_size = 1;
+    char* batch_file_output_path = nullptr;
 };
 
 namespace detail {

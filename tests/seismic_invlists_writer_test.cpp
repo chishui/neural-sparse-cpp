@@ -45,8 +45,7 @@ TEST(SeismicInvertedListsWriter, serialize_deserialize_empty) {
     writer.serialize(&io_writer);
 
     nsparse::BufferedIOReader io_reader(io_writer.data());
-    std::vector<nsparse::InvertedListClusters> loaded;
-    nsparse::SeismicInvertedListsWriter reader(loaded);
+    nsparse::SeismicInvertedListsWriter reader;
     reader.deserialize(&io_reader);
 
     auto result = reader.release();
@@ -66,8 +65,7 @@ TEST(SeismicInvertedListsWriter, serialize_deserialize_single_cluster) {
     writer.serialize(&io_writer);
 
     nsparse::BufferedIOReader io_reader(io_writer.data());
-    std::vector<nsparse::InvertedListClusters> loaded;
-    nsparse::SeismicInvertedListsWriter reader(loaded);
+    nsparse::SeismicInvertedListsWriter reader;
     reader.deserialize(&io_reader);
 
     auto result = reader.release();
@@ -101,8 +99,7 @@ TEST(SeismicInvertedListsWriter, serialize_deserialize_multiple_clusters) {
     writer.serialize(&io_writer);
 
     nsparse::BufferedIOReader io_reader(io_writer.data());
-    std::vector<nsparse::InvertedListClusters> loaded;
-    nsparse::SeismicInvertedListsWriter reader(loaded);
+    nsparse::SeismicInvertedListsWriter reader;
     reader.deserialize(&io_reader);
 
     auto result = reader.release();
@@ -130,8 +127,7 @@ TEST(SeismicInvertedListsWriter, serialize_deserialize_with_summaries) {
     writer.serialize(&io_writer);
 
     nsparse::BufferedIOReader io_reader(io_writer.data());
-    std::vector<nsparse::InvertedListClusters> loaded;
-    nsparse::SeismicInvertedListsWriter reader(loaded);
+    nsparse::SeismicInvertedListsWriter reader;
     reader.deserialize(&io_reader);
 
     auto result = reader.release();
@@ -139,15 +135,40 @@ TEST(SeismicInvertedListsWriter, serialize_deserialize_with_summaries) {
     ASSERT_EQ(result[0].cluster_size(), 2);
 }
 
-TEST(SeismicInvertedListsWriter, release_moves_data) {
+// release() hands over what deserialize() read; it is not a way to take back a
+// vector handed in for writing, which the writer only borrows.
+TEST(SeismicInvertedListsWriter, release_moves_deserialized_data) {
     std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}};
     nsparse::InvertedListClusters clusters(docs);
 
     std::vector<nsparse::InvertedListClusters> original;
     original.push_back(std::move(clusters));
 
-    nsparse::SeismicInvertedListsWriter writer(original);
+    nsparse::BufferedIOWriter io_writer;
+    nsparse::SeismicInvertedListsWriter(original).serialize(&io_writer);
 
-    auto released = writer.release();
+    nsparse::BufferedIOReader io_reader(io_writer.data());
+    nsparse::SeismicInvertedListsWriter reader;
+    reader.deserialize(&io_reader);
+
+    auto released = reader.release();
     ASSERT_EQ(released.size(), 1);
+    ASSERT_EQ(released[0].get_docs(0).size(), 2);
+    // Moved out, so the writer no longer holds it.
+    ASSERT_TRUE(reader.release().empty());
+}
+
+// Writing borrows: the caller's vector is left intact, not emptied.
+TEST(SeismicInvertedListsWriter, serialize_leaves_the_source_intact) {
+    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2}};
+    std::vector<nsparse::InvertedListClusters> original;
+    original.emplace_back(docs);
+
+    nsparse::BufferedIOWriter io_writer;
+    nsparse::SeismicInvertedListsWriter writer(original);
+    writer.serialize(&io_writer);
+
+    ASSERT_EQ(original.size(), 1);
+    ASSERT_EQ(original[0].get_docs(0).size(), 2);
+    ASSERT_GT(io_writer.size(), 0);
 }

@@ -8,18 +8,23 @@
 # Unit tests for nsparse library
 
 set(NSPARSE_TEST_SRC
+    buf_test.cpp
+    csr_layout_test.cpp
     distance_test.cpp
     exact_matcher_test.cpp
     id_map_index_test.cpp
     id_selector_test.cpp
     index_factory_test.cpp
     index_io_test.cpp
+    index_test.cpp
     inline_forward_index_test.cpp
     inverted_index_test.cpp
     inverted_index_recall_test.cpp
     inverted_list_clusters_test.cpp
     inverted_lists_test.cpp
     kmeans_utils_test.cpp
+    mmap_cursor_test.cpp
+    mmap_index_test.cpp
     prefetch_test.cpp
     random_kmeans_test.cpp
     ranker_test.cpp

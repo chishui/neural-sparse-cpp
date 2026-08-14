@@ -75,19 +75,17 @@ void IDMapIndex::add_with_ids(idx_t n, const idx_t* indptr,
     }
 }
 void IDMapIndex::write_index(IOWriter* io_writer) {
-    nsparse::detail::write_index(delegate_.get(), io_writer, true);
-
     // Write internal_to_external_ vector
     size_t map_size = internal_to_external_.size();
     io_writer->write(&map_size, sizeof(size_t), 1);
     if (map_size > 0) {
         io_writer->write(internal_to_external_.data(), sizeof(idx_t), map_size);
     }
+    // delegate should be written at the end
+    nsparse::detail::write_index(delegate_.get(), io_writer, true);
 }
 
-void IDMapIndex::read_index(IOReader* io_reader) {
-    delegate_.reset(nsparse::detail::read_index(io_reader, true));
-
+void IDMapIndex::read_index(IOReader* io_reader, int io_flags) {
     // Read internal_to_external_ vector
     size_t map_size = 0;
     io_reader->read(&map_size, sizeof(size_t), 1);
@@ -95,6 +93,8 @@ void IDMapIndex::read_index(IOReader* io_reader) {
     if (map_size > 0) {
         io_reader->read(internal_to_external_.data(), sizeof(idx_t), map_size);
     }
+
+    delegate_.reset(nsparse::detail::read_index(io_reader, true, io_flags));
 
     // Rebuild external_to_internal_ from internal_to_external_
     external_to_internal_.clear();

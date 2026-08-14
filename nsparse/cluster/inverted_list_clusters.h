@@ -13,20 +13,21 @@
 #include <span>
 #include <vector>
 
-#include "nsparse/io/io.h"
+#include "nsparse/io/mmap_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/buf.h"
 
 namespace nsparse {
 
-class InvertedListClusters : public Serializable {
+class InvertedListClusters : public MmapSerializable {
 public:
     InvertedListClusters() = default;
     InvertedListClusters(const std::vector<std::vector<idx_t>>& docs);
-    // copy constructor
-    InvertedListClusters(const InvertedListClusters& other);
-    InvertedListClusters& operator=(const InvertedListClusters& other);
-    // move constructor
+    // Move-only, because Buf is: a Buf may borrow memory it does not own, and
+    // copying one would either alias the lender or silently deep-copy.
+    InvertedListClusters(const InvertedListClusters& other) = delete;
+    InvertedListClusters& operator=(const InvertedListClusters& other) = delete;
     InvertedListClusters(InvertedListClusters&& other) noexcept = default;
     InvertedListClusters& operator=(InvertedListClusters&& other) noexcept =
         default;
@@ -40,48 +41,46 @@ public:
 
     void serialize(IOWriter* writer) const override;
     void deserialize(IOReader* reader) override;
+    void mmap_deserialize(MmapCursor* cursor) override;
 
-    // Accumulate per-cluster summary scores for a query into `out` (resized to
-    // the cluster count) using the term-major transpose. The query is given as
-    // its sparse (term, value) pairs; `q_val_bytes` points at the query values
-    // in the same element width as the stored summaries (float / uint16 /
-    // uint8), matching how the dense path reinterprets the query buffer. A
-    // query term is located by binary-searching term_ids_ (the distinct summary
-    // terms, ascending), so no dimension-sized lookup table is retained and the
-    // per-list footprint is proportional to the summaries' nnz.
+    // Accumulate per-cluster summary scores for the query's sparse (term,
+    // value) pairs into `out`, resized to the cluster count. `q_val_bytes` must
+    // use the same element width as the stored summaries (float / uint16 /
+    // uint8), matching how the dense path reinterprets the query buffer. Terms
+    // are located by binary search over term_ids_, so the per-list footprint
+    // stays proportional to the summaries' nnz rather than the dimension.
     void score_summaries_transposed(const term_t* q_idx,
                                     const uint8_t* q_val_bytes, size_t q_len,
                                     std::vector<float>& out) const;
 
 private:
-    // Build the term-major (CSC) transpose from a per-cluster CSR summary.
+    // Build the term-major (CSC) transpose from a per-cluster CSR summary. The
+    // CSR summary is transient; only the transpose is retained.
     void build_transpose(const SparseVectors& summaries);
     template <class T>
     void score_summaries_typed(const term_t* q_idx, const T* q_val,
                                size_t q_len, std::vector<float>& out) const;
 
-    std::vector<idx_t> docs_;
-    std::vector<idx_t> offsets_;
-
     // Cluster ids within a posting list are bounded by beta (clusters per
-    // list), a small fraction of lambda (docs kept per list) that stays far
-    // below 2^16 for any workable configuration; the canonical Rust seismic
-    // stores this same field and likewise caps the summary count at 2^16. A
-    // 16-bit cluster id therefore halves this array vs a 32-bit one at no
-    // recall cost (build_transpose asserts the bound holds).
+    // list), which stays far below 2^16 for any workable configuration — the
+    // canonical Rust seismic likewise caps the summary count at 2^16. 16 bits
+    // therefore halve csc_cluster_ at no recall cost (build_transpose asserts
+    // the bound holds).
     using cluster_id_t = uint16_t;
 
-    // Term-major transpose of the cluster summaries (replaces a CSR store). For
-    // each distinct summary term term_ids_[i], entries
-    // [term_ptr_[i], term_ptr_[i + 1]) in csc_cluster_/csc_value_ hold the
-    // (cluster id, summary value) pairs for that term. Scoring iterates the
-    // query's terms and scatter-adds q_val * summary_value into out[cluster].
+    // Term-major transpose of the cluster summaries. For each distinct summary
+    // term term_ids_[i], entries [term_ptr_[i], term_ptr_[i + 1]) of
+    // csc_cluster_/csc_value_ hold that term's (cluster id, summary value)
+    // pairs.
     size_t n_clusters_ = 0;
-    size_t element_size_ = U32;              // width of each csc_value_ entry
-    std::vector<term_t> term_ids_;           // distinct summary terms, ascending
-    std::vector<idx_t> term_ptr_;            // CSC offsets, size term_ids_+1
-    std::vector<cluster_id_t> csc_cluster_;  // cluster id per entry
-    std::vector<uint8_t> csc_value_;         // summary value per entry (bytes)
+    size_t element_size_ = U32;        // width of each csc_value_ entry
+
+    Buf<idx_t> docs_;
+    Buf<idx_t> offsets_;
+    Buf<term_t> term_ids_;             // distinct summary terms, ascending
+    Buf<idx_t> term_ptr_;              // CSC offsets, size term_ids_+1
+    Buf<cluster_id_t> csc_cluster_;    // cluster id per entry
+    Buf<uint8_t> csc_value_;           // summary value per entry (bytes)
 };
 
 }  // namespace nsparse

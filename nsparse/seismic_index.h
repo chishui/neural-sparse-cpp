@@ -10,11 +10,12 @@
 #ifndef SEISMIC_INDEX_H
 #define SEISMIC_INDEX_H
 #include <array>
+#include <memory>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
-#include "nsparse/index.h"
+#include "nsparse/mmap_index.h"
 #include "nsparse/io/io.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
@@ -30,10 +31,7 @@ struct SeismicSearchParameters : public SearchParameters {
     SeismicSearchParameters() = default;
 };
 
-class SeismicIndex : public Index, public IndexIO {
-    friend void write_index(Index* index, char* filename);
-    friend Index* read_index(char* filename);
-
+class SeismicIndex : public MmapIndex, public IndexIO {
 public:
     static constexpr std::array<char, 4> name = {'S', 'E', 'I', 'S'};
 
@@ -45,19 +43,19 @@ public:
     SeismicIndex(const SeismicIndex&) = delete;
     SeismicIndex& operator=(const SeismicIndex&) = delete;
 
-    const SparseVectors* get_vectors() const override;
     void build() override;
 
     void add(idx_t n, const idx_t* indptr, const term_t* indices,
              const float* values) override;
-
+    
+    static SeismicIndex* mmap_index(int dimension, const char * index_file, size_t pos);
 protected:
     std::vector<InvertedListClusters> clustered_inverted_lists;
 
 private:
     // override of IndexIO
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader) override;
+    void read_index(IOReader* io_reader, int io_flags = 0) override;
 
     auto search(idx_t n, const idx_t* indptr, const term_t* indices,
                 const float* values, int k,
@@ -74,7 +72,7 @@ private:
                       size_t q_len, const std::vector<term_t>& cuts, int k,
                       float heap_factor, SearchParameters* search_parameters)
         -> pair_of_score_id_vector_t;
-    std::unique_ptr<SparseVectors> vectors_;
+    
     SeismicClusterParameters cluster_parameter_;
 };
 }  // namespace nsparse

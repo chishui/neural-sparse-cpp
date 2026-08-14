@@ -10,9 +10,18 @@
 #include "nsparse/index.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
+#include "nsparse/utils/csr_layout.h"
 
 namespace nsparse {
 
@@ -51,4 +60,84 @@ void Index::add_with_ids(idx_t n, const idx_t* indptr, const term_t* indices,
     throw_not_implemented("add_with_ids not implemented in Index");
 }
 
+void Index::read_csr(const char* file_path, Residency residency) {
+    throw_if_null(file_path, "file_path must not be null");
+    if (!std::filesystem::exists(file_path)) {
+        throw std::invalid_argument(std::string("CSR file does not exist: ") +
+                                    file_path);
+    }
+
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error(std::string("Cannot open CSR file: ") +
+                                 file_path);
+    }
+
+    auto read_or_throw = [&file, file_path](void* dest, size_t bytes) {
+        file.read(static_cast<char*>(dest),
+                  static_cast<std::streamsize>(bytes));
+        if (!file) {
+            throw std::runtime_error(std::string("Truncated CSR file: ") +
+                                     file_path);
+        }
+    };
+
+    std::array<int64_t, 3> header{};
+    read_or_throw(header.data(), sizeof(header));
+    const int64_t num_rows = header[0];
+    const int64_t num_cols = header[1];
+    const int64_t nnz = header[2];
+
+    if (num_rows <= 0 || num_cols <= 0 || nnz < 0) {
+        throw std::invalid_argument(std::string("Invalid CSR header in: ") +
+                                    file_path);
+    }
+    if (num_rows > std::numeric_limits<idx_t>::max() ||
+        nnz > std::numeric_limits<idx_t>::max()) {
+        throw std::invalid_argument(std::string("CSR file too large for ") +
+                                    "32-bit offsets: " + file_path);
+    }
+    if (num_cols > dimension_) {
+        throw std::invalid_argument(
+            std::string("CSR column count exceeds index dimension: ") +
+            file_path);
+    }
+
+    const size_t indptr_size = static_cast<size_t>(num_rows) + 1;
+    const auto nnz_size = static_cast<size_t>(nnz);
+    // Interchange layout only; a native file is rejected rather than guessed at.
+    if (std::filesystem::file_size(file_path) !=
+        csr_layout::interchange_file_size(indptr_size, nnz_size)) {
+        throw std::invalid_argument(
+            std::string("CSR file is not in the interchange layout: ") +
+            file_path);
+    }
+
+    std::vector<int64_t> file_indptr(indptr_size);
+    read_or_throw(file_indptr.data(), file_indptr.size() * sizeof(int64_t));
+    if (file_indptr.front() != 0 || file_indptr.back() != nnz) {
+        throw std::invalid_argument(
+            std::string("Inconsistent CSR indptr in: ") + file_path);
+    }
+    std::vector<idx_t> indptr(file_indptr.begin(), file_indptr.end());
+
+    std::vector<int32_t> file_indices(nnz_size);
+    read_or_throw(file_indices.data(), file_indices.size() * sizeof(int32_t));
+    // Narrowing to term_t would wrap silently. Affordable here because every
+    // element is being copied anyway; the mapped reader skips it.
+    if (std::ranges::any_of(file_indices, [num_cols](int32_t term) {
+            return term < 0 || term >= num_cols ||
+                   term > std::numeric_limits<term_t>::max();
+        })) {
+        throw std::invalid_argument(std::string("CSR term out of range in: ") +
+                                    file_path);
+    }
+    std::vector<term_t> indices(file_indices.begin(), file_indices.end());
+
+    std::vector<float> values(nnz_size);
+    read_or_throw(values.data(), values.size() * sizeof(float));
+
+    add(static_cast<idx_t>(num_rows), indptr.data(), indices.data(),
+        values.data());
+}
 }  // namespace nsparse

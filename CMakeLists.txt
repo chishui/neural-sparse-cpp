@@ -15,6 +15,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(WIN32)
+    # mmap_file.h defines both before including windows.h, but a dependency's
+    # header may pull windows.h in first -- and its min/max macros break every
+    # later std::numeric_limits<T>::max(). Set here as well so include order
+    # cannot decide whether the build succeeds.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # Third party dependencies
 include(cmake/third_party.cmake)
 

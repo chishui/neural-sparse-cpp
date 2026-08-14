@@ -14,15 +14,22 @@
 #include "nsparse/io/io.h"
 namespace nsparse {
 
+enum IndexIoFlag {
+    kUseMmap = 0x0001,
+};
+
 namespace detail {
 void write_index(Index* index, IOWriter* io_writer, bool keep_open);
-Index* read_index(IOReader* io_reader, bool keep_open);
+// `filename`, when given, lets an index that was written for mmap borrow from
+// the file instead of copying; without one the copying path is used, since a
+// stream has no file to map.
+Index* read_index(IOReader* io_reader, bool keep_open, int io_flags = 0);
 }  // namespace detail
 
-void write_index(Index* index, char* filename);
+void write_index(Index* index, char* file_name);
 void write_index(Index* index, IOWriter* io_writer);
-Index* read_index(char* filename);
-Index* read_index(IOReader* io_reader);
+Index* read_index(char* file_name, int io_flags = 0);
+Index* read_index(IOReader* io_reader, int io_flags = 0);
 
 }  // namespace nsparse
 

@@ -43,7 +43,7 @@ protected:
 private:
     // IndexIO overrides
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader) override;
+    void read_index(IOReader* io_reader, int io_flags) override;
 
     auto single_query(const term_t* indices, const float* values, int size,
                       int k) -> pair_of_score_id_vector_t;
