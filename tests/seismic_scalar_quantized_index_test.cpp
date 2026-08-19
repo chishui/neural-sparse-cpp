@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <random>
@@ -898,6 +899,63 @@ std::vector<idx_t> search_top(Index* index, term_t term, int k) {
     return labels;
 }
 
+// Labels and scores together: a mapped read that returned subtly wrong values
+// while preserving the ranking would pass a labels-only comparison.
+std::pair<std::vector<float>, std::vector<idx_t>> search_scored(Index* index,
+                                                                term_t term,
+                                                                int k) {
+    std::vector<idx_t> indptr = {0, 1};
+    std::vector<term_t> indices = {term};
+    std::vector<float> values = {1.0F};
+    std::vector<idx_t> labels(k, INVALID_IDX);
+    std::vector<float> distances(k, -1.0F);
+    SeismicSearchParameters params(5, 1.0F);
+    index->search(1, indptr.data(), indices.data(), values.data(), k,
+                  distances.data(), labels.data(), &params);
+    return {distances, labels};
+}
+
+// Every byte of the stored CSR, not just its shape: the mapped reader borrows
+// these arrays in place, so a wrong offset or a skipped pad shows up here.
+void expect_same_vectors(const SparseVectors* lhs, const SparseVectors* rhs) {
+    ASSERT_NE(lhs, nullptr);
+    ASSERT_NE(rhs, nullptr);
+    ASSERT_EQ(lhs->num_vectors(), rhs->num_vectors());
+    ASSERT_EQ(lhs->get_element_size(), rhs->get_element_size());
+    ASSERT_EQ(lhs->get_dimension(), rhs->get_dimension());
+
+    const size_t rows = lhs->num_vectors();
+    for (size_t i = 0; i <= rows; ++i) {
+        ASSERT_EQ(lhs->indptr_data()[i], rhs->indptr_data()[i])
+            << "indptr[" << i << "]";
+    }
+    const size_t nnz = static_cast<size_t>(lhs->indptr_data()[rows]);
+    for (size_t i = 0; i < nnz; ++i) {
+        ASSERT_EQ(lhs->indices_data()[i], rhs->indices_data()[i])
+            << "indices[" << i << "]";
+    }
+    for (size_t i = 0; i < nnz * lhs->get_element_size(); ++i) {
+        ASSERT_EQ(lhs->values_data()[i], rhs->values_data()[i])
+            << "values byte " << i;
+    }
+}
+
+#if defined(__linux__)
+// How many mappings of `path` the process holds, straight from the kernel's
+// view. The only way to tell a released mapping from a leaked one.
+size_t count_mappings_of(const std::string& path) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    size_t count = 0;
+    while (std::getline(maps, line)) {
+        if (line.find(path) != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+#endif
+
 }  // namespace
 
 class SeismicSQIndexMmapIO : public testing::TestWithParam<QuantizerType> {};
@@ -935,11 +993,100 @@ TEST_P(SeismicSQIndexMmapIO, mapped_read_matches_the_copying_read) {
               GetParam());
     EXPECT_EQ(mapped->get_vectors()->get_element_size(),
               mapped_sq->get_scalar_quantizer().bytes_per_value());
+
+    // The borrowed CSR must be the copied one byte for byte, not merely the
+    // same shape.
+    expect_same_vectors(mapped->get_vectors(), copied->get_vectors());
+
+    for (term_t term = 0; term < 5; ++term) {
+        const auto [mapped_scores, mapped_labels] =
+            search_scored(mapped.get(), term, 4);
+        const auto [copied_scores, copied_labels] =
+            search_scored(copied.get(), term, 4);
+        EXPECT_EQ(mapped_labels, copied_labels) << "term " << term;
+        ASSERT_EQ(mapped_scores.size(), copied_scores.size());
+        for (size_t i = 0; i < mapped_scores.size(); ++i) {
+            EXPECT_FLOAT_EQ(mapped_scores[i], copied_scores[i])
+                << "term " << term << " score " << i;
+        }
+    }
+}
+
+// The quantized payload opens with a 9-byte quantizer header (a 1-byte enum and
+// two floats), which shifts every array behind it relative to the float layout
+// -- and the padding io_align inserts is computed from those absolute offsets.
+// An odd nnz and an empty row move the offsets again; 8-bit codes cannot catch
+// a values-array padding bug on their own, since alignment 1 makes the padding
+// always zero.
+TEST_P(SeismicSQIndexMmapIO, mapped_read_matches_the_copying_read_odd_layout) {
+    TempIndexFile file("nsparse_sesq_odd_layout.idx");
+
+    // nnz = 5 (odd), with an empty row in the middle.
+    TestableSeismicSQIndex source(GetParam(), 0.0F, 1.0F, 10, 2, 0.5F, 5);
+    source.add_docs(
+        {{{0, 1.0F}, {3, 0.9F}}, {}, {{1, 0.4F}}, {{2, 0.7F}, {4, 0.25F}}});
+    source.build();
+    write_index(&source, file.c_str());
+
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    std::unique_ptr<Index> copied(read_index(file.c_str()));
+    ASSERT_NE(mapped, nullptr);
+    ASSERT_NE(copied, nullptr);
+
+    ASSERT_EQ(mapped->get_vectors()->indptr_data()[4], 5);
+    expect_same_vectors(mapped->get_vectors(), copied->get_vectors());
     for (term_t term = 0; term < 5; ++term) {
         EXPECT_EQ(search_top(mapped.get(), term, 4),
                   search_top(copied.get(), term, 4))
             << "term " << term;
     }
+}
+
+// What the padding exists for: the values array is reinterpreted at the code
+// width in place, so a mapped start that is not a multiple of that width is UB
+// on x86 and faults on ARM. MmapCursor rejects a misaligned array, but only for
+// types whose alignof says so -- values are bytes on the wire, so this is the
+// only check that the element-width padding actually landed.
+TEST_P(SeismicSQIndexMmapIO, mapped_values_are_aligned_for_the_code_width) {
+    TempIndexFile file("nsparse_sesq_align.idx");
+    TestableSeismicSQIndex source(GetParam(), 0.0F, 1.0F, 10, 2, 0.5F, 5);
+    source.add_docs({{{0, 1.0F}, {3, 0.9F}}, {}, {{1, 0.4F}}});  // nnz = 3, odd
+    source.build();
+    write_index(&source, file.c_str());
+
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(mapped, nullptr);
+    const auto* vectors = mapped->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    const auto element_size = vectors->get_element_size();
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(vectors->values_data()) % element_size, 0U);
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(vectors->indptr_data()) % alignof(idx_t),
+        0U);
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(vectors->indices_data()) % alignof(term_t),
+        0U);
+}
+
+// Writer and copying reader must agree on every pad, or the mapped reader --
+// which computes the same padding from the same absolute offsets -- borrows
+// from the wrong place. Consuming exactly what was written is that agreement.
+TEST_P(SeismicSQIndexMmapIO, copying_read_consumes_exactly_what_was_written) {
+    TestableSeismicSQIndex source(GetParam(), 0.0F, 1.0F, 10, 2, 0.5F, 5);
+    source.add_docs({{{0, 1.0F}, {3, 0.9F}}, {}, {{1, 0.4F}}});  // nnz = 3, odd
+    source.build();
+
+    BufferedIOWriter writer;
+    write_index(&source, &writer);
+    const size_t written = writer.size();
+
+    BufferedIOReader reader(writer.data());
+    std::unique_ptr<Index> loaded(read_index(&reader));
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(reader.pos(), written);
 }
 
 // The point of the mapped path: the arrays point into the file, not into fresh
@@ -1008,6 +1155,60 @@ TEST(SeismicSQIndexMmapIOSingle, mapped_read_of_an_empty_index) {
               QuantizerType::QT_16bit);
     EXPECT_FLOAT_EQ(loaded_sq->get_scalar_quantizer().get_min(), 0.25F);
     EXPECT_FLOAT_EQ(loaded_sq->get_scalar_quantizer().get_max(), 2.0F);
+}
+
+// The mapping must go away with the index that owns it. MmapFile unmaps in its
+// destructor and drops the fd right after mmap(), but nothing held that to
+// account: a mapping kept alive by a stray copy, or an fd left open, only shows
+// up as a process that grows until it cannot open another index.
+TEST(SeismicSQIndexMmapIOSingle, mapped_index_releases_the_mapping_and_the_fd) {
+    TempIndexFile file("nsparse_sesq_release.idx");
+    auto source = built_index(QuantizerType::QT_8bit);
+    write_index(source.get(), file.c_str());
+    const std::string path = file.c_str();
+
+#if defined(__linux__)
+    const size_t before = count_mappings_of(path);
+    {
+        std::unique_ptr<Index> loaded(
+            read_index(file.c_str(), IndexIoFlag::kUseMmap));
+        ASSERT_NE(loaded, nullptr);
+        ASSERT_NE(loaded->get_vectors(), nullptr);
+        EXPECT_GT(count_mappings_of(path), before) << "index is not mapped";
+    }
+    EXPECT_EQ(count_mappings_of(path), before)
+        << "mapping outlived the index that owns it";
+#endif
+
+    // Open and destroy far more times than the default fd limit: a leaked
+    // descriptor per mapped read fails here with "failed to open", and a leaked
+    // mapping shows up on Linux in the check above.
+    for (int i = 0; i < 2048; ++i) {
+        std::unique_ptr<Index> loaded(
+            read_index(file.c_str(), IndexIoFlag::kUseMmap));
+        ASSERT_NE(loaded, nullptr) << "iteration " << i;
+        ASSERT_EQ(loaded->get_vectors()->num_vectors(), 4) << "iteration " << i;
+    }
+}
+
+// The mapping outlives every borrower: searching a mapped index after the
+// MmapFile has been moved into it, and destroying in the base-class order, must
+// not touch unmapped memory. Runs the search twice so a use-after-unmap has
+// something to read.
+TEST(SeismicSQIndexMmapIOSingle, mapped_index_stays_valid_for_its_whole_life) {
+    TempIndexFile file("nsparse_sesq_lifetime.idx");
+    auto source = built_index(QuantizerType::QT_8bit);
+    write_index(source.get(), file.c_str());
+
+    std::unique_ptr<Index> loaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(loaded, nullptr);
+    const auto first = search_top(loaded.get(), 2, 4);
+    // Deleting the file leaves the mapping intact on POSIX; the pages are the
+    // kernel's now, not the directory entry's.
+    const auto second = search_top(loaded.get(), 2, 4);
+    EXPECT_EQ(first, second);
+    loaded.reset();  // must not fault, and must not double-unmap
 }
 
 // A mapped CSR is borrowed at the width it was written in, which is float, so
