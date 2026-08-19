@@ -499,8 +499,8 @@ TEST(InvertedIndexSearch, search_with_id_selector_filters_results) {
     EXPECT_FLOAT_EQ(distances[1], 0.3F);
 }
 
-// The selector is read off the SearchParameters base, so callers may pass any
-// subclass (the JNI layer hands over a seismic-flavored one).
+// The selector is read off the base, so any subclass works — the JNI layer
+// passes a seismic one.
 TEST(InvertedIndexSearch,
      search_honors_selector_on_search_parameters_subclass) {
     struct DerivedSearchParameters : SearchParameters {};
@@ -558,8 +558,7 @@ TEST(InvertedIndexSearch, search_with_id_selector_matching_nothing) {
     EXPECT_EQ(labels[1], -1);
 }
 
-// A plain (non-enumerable) IDSelector must work too — filtering happens through
-// is_member, not by enumerating ids.
+// Non-enumerable selectors work too: filtering goes through is_member.
 TEST(InvertedIndexSearch, search_with_non_enumerable_id_selector) {
     InvertedIndex index(3);
     Index* idx = &index;
@@ -588,9 +587,7 @@ TEST(InvertedIndexSearch, search_with_non_enumerable_id_selector) {
     EXPECT_EQ(labels[2], -1);
 }
 
-// Filtering must hold on the multi-term path, where the excluded doc would
-// otherwise set the heap threshold and where non-essential terms are only
-// scored for candidates that survive.
+// Multi-term path: the excluded doc would otherwise set the heap threshold.
 TEST(InvertedIndexSearch, search_with_id_selector_multi_term) {
     InvertedIndex index(4);
     Index* idx = &index;
@@ -623,8 +620,7 @@ TEST(InvertedIndexSearch, search_with_id_selector_multi_term) {
     EXPECT_FLOAT_EQ(distances[1], 0.72F);
 }
 
-// Docs spread over several scoring windows, with allowed ids in each, so the
-// filter is exercised alongside window advancement and re-partitioning.
+// Allowed ids in several scoring windows, exercising window advancement.
 TEST(InvertedIndexSearch, search_with_id_selector_multi_window) {
     constexpr int kDim = 2;
     constexpr int kNumDocs = 6000;  // > kScoreWindowSize (4096)

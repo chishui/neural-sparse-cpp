@@ -183,11 +183,8 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
                 continue;
             }
 
-            // Filtered-out docs must not reach the heap, and must not raise the
-            // threshold either — skip before the non-essential terms are
-            // scored. Ordered after the bound check because is_member costs a
-            // virtual call plus a set probe, while the bound check is two
-            // arithmetic ops; both are pure skips, so the order is free.
+            // Filtered docs neither enter the heap nor raise the threshold.
+            // Checked after the cheaper score bound; both are pure skips.
             if (id_selector != nullptr && !id_selector->is_member(doc)) {
                 continue;
             }
@@ -274,7 +271,7 @@ auto InvertedIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
     const auto* query_indices = query_vectors.indices_data();
     const auto* query_values = query_vectors.values_data_float();
 
-    // Only the id selector is read here; any SearchParameters subclass works.
+    // Read off the base, so any SearchParameters subclass works.
     const IDSelector* id_selector = search_parameters == nullptr
                                         ? nullptr
                                         : search_parameters->get_id_selector();

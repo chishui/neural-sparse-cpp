@@ -45,7 +45,7 @@ private:
     void write_index(IOWriter* io_writer) override;
     void read_index(IOReader* io_reader, int io_flags) override;
 
-    // `id_selector` (may be null) restricts results to member doc ids.
+    // `id_selector` may be null; when set, only member docs are returned.
     auto single_query(const term_t* indices, const float* values, int size,
                       int k, const IDSelector* id_selector)
         -> pair_of_score_id_vector_t;
