@@ -39,6 +39,17 @@ namespace {
 
 constexpr int kElementSize = U32;
 
+// Values are read back as float, at the width add() encoded them with. A file
+// declaring anything else would be strided at the wrong width, past the end of
+// the array for a narrower one, so reject it at load rather than at search.
+void throw_if_element_size_mismatch(const SparseVectors& vectors) {
+    if (vectors.num_vectors() > 0 &&
+        vectors.get_element_size() != kElementSize) {
+        throw std::runtime_error(
+            "index file's element size is not the seismic index's");
+    }
+}
+
 void query_single_inverted_list(
     const SparseVectors* vectors, const InvertedListClusters& cluster_invlist,
     const std::vector<float>& dense, const term_t* q_idx, const float* q_val,
@@ -59,8 +70,6 @@ void query_single_inverted_list(
     cluster_invlist.score_summaries_transposed(
         q_idx, reinterpret_cast<const uint8_t*>(q_val), q_len, score_scratch);
     const std::vector<float>& summary_scores = score_scratch;
-    size_t num_vectors = vectors->num_vectors();
-
     std::vector<size_t> cluster_order =
         detail::reorder_clusters(summary_scores, first_list);
 
@@ -149,11 +158,14 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
                 std::vector<std::vector<idx_t>>(n)};
     }
 
+    // Parameters that carry no cut / heap factor (none at all, or a plain
+    // SearchParameters holding just an id selector) fall back to the defaults
+    // rather than being dereferenced as null.
     SeismicSearchParameters default_params;
+    const auto* seismic_parameters =
+        dynamic_cast<const SeismicSearchParameters*>(search_parameters);
     const auto* parameters =
-        search_parameters != nullptr
-            ? dynamic_cast<const SeismicSearchParameters*>(search_parameters)
-            : &default_params;
+        seismic_parameters != nullptr ? seismic_parameters : &default_params;
     if (search_parameters != nullptr) {
         const IDSelector* sel = search_parameters->get_id_selector();
         // should_run_exact_match ignores its queries arg (only inspects the
@@ -276,6 +288,7 @@ void SeismicIndex::read_index(IOReader* io_reader, int io_flags) {
     // read vectors
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
+    throw_if_element_size_mismatch(tmp_vectors);
     if (tmp_vectors.num_vectors() > 0) {
         vectors_ = std::make_unique<SparseVectors>(std::move(tmp_vectors));
     }
@@ -299,6 +312,7 @@ SeismicIndex* SeismicIndex::mmap_index(int dimension, const char* index_file,
     // Same order write_index wrote them.
     auto vectors = std::make_unique<SparseVectors>();
     vectors->mmap_deserialize(&cursor);
+    throw_if_element_size_mismatch(*vectors);
 
     SeismicInvertedListsWriter inv_list_writer;
     inv_list_writer.mmap_deserialize(&cursor);

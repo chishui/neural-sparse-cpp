@@ -42,6 +42,18 @@ if(NSPARSE_BENCHMARK_SRC)
     )
 endif()
 
+# Latency / residency / recall driver for a single serialized index. Not a
+# google-benchmark target: it reports the per-query tail, the RssAnon/RssFile
+# split and recall, none of which that harness can express.
+add_executable(sq_residency_bench sq_residency_bench.cpp)
+target_include_directories(sq_residency_bench PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(sq_residency_bench PRIVATE
+    nsparse
+    OpenMP::OpenMP_CXX
+    absl::flat_hash_set
+    absl::flat_hash_map
+)
+
 # Build-time benchmark: SeismicIndex build() on CPU vs GPU (cuSPARSE). The GPU
 # case is compiled in only when the nsparse target carries CUDA support (the
 # NSPARSE_WITH_GPU define propagates from the nsparse target).

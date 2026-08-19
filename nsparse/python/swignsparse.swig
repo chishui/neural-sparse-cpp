@@ -92,6 +92,7 @@ import_array();
 // Hands back an index borrowing from a mapping it does not own; see the
 // SparseVectors mmap ignores above.
 %ignore nsparse::SeismicIndex::mmap_index;
+%ignore nsparse::SeismicScalarQuantizedIndex::mmap_index;
 %ignore nsparse::InvertedListClusters::serialize;
 %ignore nsparse::InvertedListClusters::deserialize;
 %ignore nsparse::detail; 

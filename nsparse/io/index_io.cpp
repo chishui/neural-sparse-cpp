@@ -69,6 +69,22 @@ private:
     T* stream_;
 };
 
+// Reads `id`'s payload by borrowing it from the file rather than copying it, or
+// returns nullptr for an index type without a mapped reader. `pos` is where the
+// payload begins, past the header read_header consumed.
+Index* mmap_index_payload(uint32_t id, int dimension, const char* file_name,
+                          size_t pos) {
+    switch (id) {
+        case SEIS:
+            return SeismicIndex::mmap_index(dimension, file_name, pos);
+        case SESQ:
+            return SeismicScalarQuantizedIndex::mmap_index(dimension, file_name,
+                                                           pos);
+        default:
+            return nullptr;
+    }
+}
+
 void write_header(Index* index, IOWriter* io_writer) {
     // write index type
     auto id_val = fourcc(index->id());
@@ -124,16 +140,20 @@ Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
     }
 
     // handle mmap
-    if (fourcc(index->id()) == SEIS &&
-        (io_flags & IndexIoFlag::kUseMmap) == IndexIoFlag::kUseMmap) {
+    if ((io_flags & IndexIoFlag::kUseMmap) == IndexIoFlag::kUseMmap) {
         if (auto* file_io_reader = dynamic_cast<FileIOReader*>(io_reader)) {
-            int dimension = index->get_dimension();
-            // Where the payload starts, which is what serialize() padded against.
-            size_t pos = io_reader->pos();
-            index.reset();
-            // The mapping takes its own handle.
-            closer.close();
-            return SeismicIndex::mmap_index(dimension, file_io_reader->file_name().c_str(), pos);
+            // The mapping takes its own handle, so the reader stays open while
+            // it is built. `pos` is where the payload starts, which is what
+            // serialize() padded against. An index type without a mapped reader
+            // returns null and falls through to the copying read below.
+            std::unique_ptr<Index> mapped(mmap_index_payload(
+                fourcc(index->id()), index->get_dimension(),
+                file_io_reader->file_name().c_str(), io_reader->pos()));
+            if (mapped != nullptr) {
+                index.reset();
+                closer.close();
+                return mapped.release();
+            }
         }
     }
 

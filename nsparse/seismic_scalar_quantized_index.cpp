@@ -14,7 +14,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
-#include <typeinfo>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -31,12 +32,37 @@
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
 #include "nsparse/utils/distance_simd.h"
+#include "nsparse/utils/mmap_file.h"
 #include "nsparse/utils/prefetch.h"
 #include "nsparse/utils/scalar_quantizer.h"
 #include "nsparse/utils/vector_process.h"
 
 namespace nsparse {
 namespace {
+
+// A quantizer described by an index file. bytes_per_value() treats anything but
+// QT_8bit as 16-bit, so an undefined type would silently pick an element width
+// rather than be rejected; the constructor covers vmax <= vmin.
+ScalarQuantizer quantizer_from_file(QuantizerType type, float vmin,
+                                    float vmax) {
+    if (type != QuantizerType::QT_8bit && type != QuantizerType::QT_16bit) {
+        throw std::runtime_error(
+            "index file declares an unknown quantizer type");
+    }
+    return ScalarQuantizer(type, vmin, vmax);
+}
+
+// The stored values were encoded at the ingest quantizer's width, and search
+// strides them at the width the quantizer reports. A file where the two
+// disagree would be read at the wrong stride, so reject it at load.
+void throw_if_element_size_mismatch(const SparseVectors& vectors,
+                                    const ScalarQuantizer& sq) {
+    if (vectors.num_vectors() > 0 &&
+        vectors.get_element_size() != sq.bytes_per_value()) {
+        throw std::runtime_error(
+            "index file's element size disagrees with its quantizer type");
+    }
+}
 
 void query_single_inverted_list(const SparseVectors* vectors,
                                 const InvertedListClusters& cluster_invlist,
@@ -61,8 +87,6 @@ void query_single_inverted_list(const SparseVectors* vectors,
     cluster_invlist.score_summaries_transposed(q_idx, q_val_bytes, q_len,
                                                score_scratch);
     const std::vector<float>& summary_scores = score_scratch;
-    size_t num_vectors = vectors->num_vectors();
-
     std::vector<size_t> cluster_order =
         detail::reorder_clusters(summary_scores, first_list);
 
@@ -112,14 +136,25 @@ void query_single_inverted_list(const SparseVectors* vectors,
 }  // namespace
 
 SeismicScalarQuantizedIndex::SeismicScalarQuantizedIndex(int dim)
-    : Index(dim), cluster_parameter_(detail::kDefaultSeismicClusterParams) {}
+    : MmapIndex(dim),
+      cluster_parameter_(detail::kDefaultSeismicClusterParams) {}
 
 SeismicScalarQuantizedIndex::SeismicScalarQuantizedIndex(
     QuantizerType quantizer_type, float vmin, float vmax,
     SeismicClusterParameters parameter, int dim)
-    : Index(dim),
+    : MmapIndex(dim),
       sq_(quantizer_type, vmin, vmax),
       cluster_parameter_(parameter) {}
+
+void SeismicScalarQuantizedIndex::read_csr(const char* file_path,
+                                           Residency residency) {
+    if (residency == Residency::kMmap) {
+        throw std::invalid_argument(
+            "mmap residency is not available for a quantized index: a mapped "
+            "CSR is borrowed as float, and this index searches over codes");
+    }
+    MmapIndex::read_csr(file_path, residency);
+}
 
 void SeismicScalarQuantizedIndex::add(idx_t n, const idx_t* indptr,
                                       const term_t* indices,
@@ -141,32 +176,23 @@ void SeismicScalarQuantizedIndex::add(idx_t n, const idx_t* indptr,
                           nnz * element_size);
 }
 
-// encode based on search_parameters type, if it's SeismicSearchParameters,
-// use Index's quantizer, if it's SeismicSQSearchParameters, construct
-// quantizer using SeismicSQSearchParameters's parameters
-std::vector<uint8_t> SeismicScalarQuantizedIndex::encode(
-    const float* values, size_t nnz, SearchParameters* search_parameters) {
-    const size_t element_size = sq_.bytes_per_value();
-    std::vector<uint8_t> codes(nnz * element_size);
-    if (typeid(*search_parameters) == typeid(SeismicSearchParameters)) {
-        sq_.encode(values, codes.data(), nnz);
-    } else if (typeid(*search_parameters) ==
-               typeid(SeismicSQSearchParameters)) {
-        const auto* seismic_sq_search_parameters =
-            static_cast<const SeismicSQSearchParameters*>(search_parameters);
-        ScalarQuantizer search_sq(sq_.get_quantizer_type(),
-                                  seismic_sq_search_parameters->vmin,
-                                  seismic_sq_search_parameters->vmax);
-        search_sq.encode(values, codes.data(), nnz);
-    } else {
-        throw std::runtime_error("Unsupported search parameters type!");
+// The quantizer a query is encoded with: SeismicSQSearchParameters overrides
+// the range the index was built with, anything else reuses it. The type is
+// always the index's, since the codes are compared against stored ones.
+ScalarQuantizer SeismicScalarQuantizedIndex::query_quantizer(
+    const SearchParameters* search_parameters) const {
+    const auto* sq_params =
+        dynamic_cast<const SeismicSQSearchParameters*>(search_parameters);
+    if (sq_params == nullptr) {
+        return sq_;
     }
-    return codes;
+    return ScalarQuantizer(sq_.get_quantizer_type(), sq_params->vmin,
+                           sq_params->vmax);
 }
 
 void SeismicScalarQuantizedIndex::build() {
     clustered_inverted_lists = std::move(detail::build_inverted_lists_clusters(
-        vectors_.get(),
+        get_vectors(),
         {.element_size = sq_.bytes_per_value(),
          .dimension = static_cast<size_t>(get_dimension())},
         cluster_parameter_));
@@ -177,7 +203,6 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
                                          const float* values, int k,
                                          SearchParameters* search_parameters)
     -> pair_of_score_id_vectors_t {
-    throw_if_null(search_parameters, "search parameters cannot be null!");
     if (vectors_ == nullptr || n == 0) {
         return {std::vector<std::vector<float>>(n),
                 std::vector<std::vector<idx_t>>(n)};
@@ -185,26 +210,22 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
     size_t indptr_size = n + 1;
     size_t nnz = indptr[n];  // Total non-zeros
 
-    // Determine query quantizer based on search parameters
-    ScalarQuantizer query_sq = sq_;  // default to same as ingest
-    if (typeid(*search_parameters) == typeid(SeismicSQSearchParameters)) {
-        const auto* sq_params =
-            static_cast<const SeismicSQSearchParameters*>(search_parameters);
-        query_sq = ScalarQuantizer(sq_.get_quantizer_type(), sq_params->vmin,
-                                   sq_params->vmax);
-    }
+    const ScalarQuantizer query_sq = query_quantizer(search_parameters);
 
     // Quantize the whole query batch once. `codes` holds the quantized values
     // in the same CSR order as `indices`, so the batch (indptr/indices/codes)
     // can be indexed directly below — no per-query SparseVectors needed.
     const size_t element_size = sq_.bytes_per_value();
-    std::vector<uint8_t> codes = encode(values, nnz, search_parameters);
+    std::vector<uint8_t> codes(nnz * element_size);
+    query_sq.encode(values, codes.data(), nnz);
     const uint8_t* query_values = codes.data();
 
+    const IDSelector* id_selector = search_parameters == nullptr
+                                        ? nullptr
+                                        : search_parameters->get_id_selector();
     // if filter ids size is <= k, just run exact match. Only this path needs a
     // SparseVectors view of the query, so build one lazily just for it.
-    if (detail::should_run_exact_match(search_parameters->get_id_selector(), k,
-                                       nullptr)) {
+    if (detail::should_run_exact_match(id_selector, k, nullptr)) {
         SparseVectors query_vectors(
             {.element_size = element_size,
              .dimension = static_cast<size_t>(dimension_)});
@@ -212,13 +233,19 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
                                   codes.data(), nnz * element_size);
         auto [distances, labels] = detail::ExactMatcher::search(
             vectors_.get(),
-            dynamic_cast<const IDSelectorEnumerable*>(
-                search_parameters->get_id_selector()),
+            dynamic_cast<const IDSelectorEnumerable*>(id_selector),
             &query_vectors, element_size, k);
-        // Decode quantized dot product scores
-        for (auto& query_distances : distances) {
-            for (auto& dist : query_distances) {
-                dist = sq_.decode_dot_product(dist, query_sq);
+        // Decode quantized dot product scores, leaving the -1 padding
+        // ExactMatcher appended for the slots it could not fill: scaling that
+        // sentinel would turn it into an ordinary small negative score.
+        for (size_t query_idx = 0; query_idx < distances.size(); ++query_idx) {
+            auto& query_distances = distances[query_idx];
+            const auto& query_labels = labels[query_idx];
+            for (size_t i = 0; i < query_distances.size(); ++i) {
+                if (query_labels[i] != INVALID_IDX) {
+                    query_distances[i] =
+                        sq_.decode_dot_product(query_distances[i], query_sq);
+                }
             }
         }
         return {distances, labels};
@@ -227,9 +254,14 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
     std::vector<std::vector<float>> result_distances(n);
     std::vector<std::vector<idx_t>> result_labels(n);
 
-    // query
-    const auto* parameters =
+    // query. Parameters that carry no cut / heap factor (none at all, or a
+    // plain SearchParameters holding just an id selector) fall back to the
+    // defaults rather than being dereferenced as null.
+    SeismicSearchParameters default_params;
+    const auto* seismic_parameters =
         dynamic_cast<const SeismicSearchParameters*>(search_parameters);
+    const auto* parameters =
+        seismic_parameters != nullptr ? seismic_parameters : &default_params;
     const size_t dense_bytes =
         static_cast<size_t>(dimension_) * element_size;
 
@@ -319,8 +351,8 @@ auto SeismicScalarQuantizedIndex::single_query(
     for (auto& dist : distances) {
         dist = sq_.decode_dot_product(dist, query_sq);
     }
-    distances.resize(k, INVALID_IDX);
-    labels.resize(k, -1.0F);
+    distances.resize(k, -1.0F);
+    labels.resize(k, INVALID_IDX);
     return {distances, labels};
 }
 
@@ -340,12 +372,50 @@ void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader, int io_flags) 
     read_header(io_reader);
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
+    throw_if_element_size_mismatch(tmp_vectors, sq_);
     if (tmp_vectors.num_vectors() > 0) {
         vectors_ = std::make_unique<SparseVectors>(std::move(tmp_vectors));
     }
     SeismicInvertedListsWriter inv_list_writer;
     inv_list_writer.deserialize(io_reader);
     clustered_inverted_lists = std::move(inv_list_writer.release());
+}
+
+SeismicScalarQuantizedIndex* SeismicScalarQuantizedIndex::mmap_index(
+    int dimension, const char* index_file, size_t pos) {
+    throw_if_null(index_file, "index_file must not be null");
+    auto index = std::make_unique<SeismicScalarQuantizedIndex>(dimension);
+
+    MmapFile mmap_file(std::string{index_file});
+    // `pos` is where write_index's payload begins, past the header read_header
+    // consumed. Absolute file offsets are what serialize() padded against, so
+    // the cursor has to start at 0 and skip rather than map from `pos`.
+    MmapCursor cursor(mmap_file.data(), mmap_file.size());
+    cursor.skip(pos);
+
+    // Same order write_index wrote them, starting with what write_header wrote.
+    const auto sq_type = cursor.read_scalar<QuantizerType>();
+    const auto vmin = cursor.read_scalar<float>();
+    const auto vmax = cursor.read_scalar<float>();
+    const ScalarQuantizer sq = quantizer_from_file(sq_type, vmin, vmax);
+
+    auto vectors = std::make_unique<SparseVectors>();
+    vectors->mmap_deserialize(&cursor);
+    throw_if_element_size_mismatch(*vectors, sq);
+
+    SeismicInvertedListsWriter inv_list_writer;
+    inv_list_writer.mmap_deserialize(&cursor);
+
+    // Committed only once everything parsed, so a corrupt file cannot leave a
+    // half-mapped index behind. mapped_file_ last: the arrays above borrow from
+    // it, and moving it does not move the mapping itself.
+    index->sq_ = sq;
+    index->clustered_inverted_lists = std::move(inv_list_writer.release());
+    if (vectors->num_vectors() > 0) {
+        index->vectors_ = std::move(vectors);
+    }
+    index->mapped_file_ = std::move(mmap_file);
+    return index.release();
 }
 
 void SeismicScalarQuantizedIndex::write_header(IOWriter* io_writer) {
@@ -364,6 +434,6 @@ void SeismicScalarQuantizedIndex::read_header(IOReader* io_reader) {
     io_reader->read(&sq_type, sizeof(QuantizerType), 1);
     io_reader->read(&vmin, sizeof(float), 1);
     io_reader->read(&vmax, sizeof(float), 1);
-    sq_ = ScalarQuantizer(sq_type, vmin, vmax);
+    sq_ = quantizer_from_file(sq_type, vmin, vmax);
 }
 }  // namespace nsparse

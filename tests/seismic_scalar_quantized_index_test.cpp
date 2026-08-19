@@ -11,7 +11,9 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <map>
+#include <memory>
 #include <random>
 #include <unordered_set>
 #include <vector>
@@ -816,6 +818,206 @@ TEST(SeismicSQIndexSearch, search_with_id_selector_filters_results) {
     EXPECT_EQ(labels[0], 2);
     EXPECT_EQ(labels[1], 0);
     EXPECT_EQ(labels[2], -1);
+}
+
+// Parameters carrying no cut / heap factor fall back to the defaults, as they
+// do for SeismicIndex, rather than being rejected or dereferenced as null.
+TEST(SeismicSQIndexSearch, search_without_seismic_parameters_uses_defaults) {
+    TestableSeismicSQIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 2,
+                                 0.5F, 3);
+    Index* idx = &index;
+
+    index.add_docs({{{0, 1.0F}, {1, 0.5F}}, {{0, 0.2F}}});
+    index.build();
+
+    std::vector<idx_t> query_indptr = {0, 1};
+    std::vector<term_t> query_indices = {0};
+    std::vector<float> query_values = {1.0F};
+    std::vector<idx_t> labels(1, -1);
+    std::vector<float> distances(1, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 1, distances.data(), labels.data(),
+                nullptr);
+    EXPECT_EQ(labels[0], 0);
+
+    SearchParameters plain_params;
+    labels[0] = -1;
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 1, distances.data(), labels.data(),
+                &plain_params);
+    EXPECT_EQ(labels[0], 0);
+}
+
+// ============== mapped read_index tests ==============
+
+namespace {
+
+// Index file removed on destruction.
+class TempIndexFile {
+public:
+    explicit TempIndexFile(const std::string& name)
+        : path_(std::filesystem::temp_directory_path() / name) {
+        std::filesystem::remove(path_);
+    }
+    ~TempIndexFile() { std::filesystem::remove(path_); }
+
+    TempIndexFile(const TempIndexFile&) = delete;
+    TempIndexFile& operator=(const TempIndexFile&) = delete;
+
+    // write_index/read_index take char*, not const char*.
+    char* c_str() { return path_str_.data(); }
+
+private:
+    std::filesystem::path path_{};
+    std::string path_str_ = path_.string();
+};
+
+// A built index with a handful of docs. Residency is a property of the reader,
+// not of the file, so the written bytes are the same either way.
+std::unique_ptr<TestableSeismicSQIndex> built_index(QuantizerType qtype) {
+    auto index = std::make_unique<TestableSeismicSQIndex>(qtype, 0.0F, 1.0F, 10,
+                                                          2, 0.5F, 5);
+    index->add_docs({{{0, 1.0F}, {2, 0.9F}},
+                     {{1, 0.5F}, {3, 0.7F}},
+                     {{0, 0.3F}, {4, 0.8F}},
+                     {{2, 0.6F}, {3, 0.4F}, {4, 0.2F}}});
+    index->build();
+    return index;
+}
+
+std::vector<idx_t> search_top(Index* index, term_t term, int k) {
+    std::vector<idx_t> indptr = {0, 1};
+    std::vector<term_t> indices = {term};
+    std::vector<float> values = {1.0F};
+    std::vector<idx_t> labels(k, INVALID_IDX);
+    std::vector<float> distances(k, -1.0F);
+    SeismicSearchParameters params(5, 1.0F);
+    index->search(1, indptr.data(), indices.data(), values.data(), k,
+                  distances.data(), labels.data(), &params);
+    return labels;
+}
+
+}  // namespace
+
+class SeismicSQIndexMmapIO : public testing::TestWithParam<QuantizerType> {};
+
+INSTANTIATE_TEST_SUITE_P(QuantizerTypes, SeismicSQIndexMmapIO,
+                         testing::Values(QuantizerType::QT_8bit,
+                                         QuantizerType::QT_16bit),
+                         [](const testing::TestParamInfo<QuantizerType>& info) {
+                             return info.param == QuantizerType::QT_8bit
+                                        ? "bit8"
+                                        : "bit16";
+                         });
+
+TEST_P(SeismicSQIndexMmapIO, mapped_read_matches_the_copying_read) {
+    TempIndexFile file("nsparse_sesq_mapped.idx");
+
+    auto source = built_index(GetParam());
+    write_index(source.get(), file.c_str());
+
+    // One file, read both ways: kUseMmap is all that separates the residencies.
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    std::unique_ptr<Index> copied(read_index(file.c_str()));
+
+    ASSERT_NE(mapped, nullptr);
+    ASSERT_NE(copied, nullptr);
+    ASSERT_EQ(mapped->get_vectors()->num_vectors(),
+              copied->get_vectors()->num_vectors());
+    // The quantizer header is part of the mapped payload, not just the copied
+    // one: without it the codes would be decoded against the wrong range.
+    const auto* mapped_sq =
+        dynamic_cast<SeismicScalarQuantizedIndex*>(mapped.get());
+    ASSERT_NE(mapped_sq, nullptr);
+    EXPECT_EQ(mapped_sq->get_scalar_quantizer().get_quantizer_type(),
+              GetParam());
+    EXPECT_EQ(mapped->get_vectors()->get_element_size(),
+              mapped_sq->get_scalar_quantizer().bytes_per_value());
+    for (term_t term = 0; term < 5; ++term) {
+        EXPECT_EQ(search_top(mapped.get(), term, 4),
+                  search_top(copied.get(), term, 4))
+            << "term " << term;
+    }
+}
+
+// The point of the mapped path: the arrays point into the file, not into fresh
+// allocations.
+TEST(SeismicSQIndexMmapIOSingle, mapped_read_borrows_from_the_file) {
+    TempIndexFile file("nsparse_sesq_borrow.idx");
+    auto source = built_index(QuantizerType::QT_8bit);
+    write_index(source.get(), file.c_str());
+
+    std::unique_ptr<Index> loaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+
+    const auto* vectors = loaded->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    // A borrowed CSR keeps the file's contiguity: indices sit right after
+    // indptr, which is only true of the mapping, not of separate allocations.
+    const auto* indptr_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indptr_data());
+    const auto* indices_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indices_data());
+    EXPECT_EQ(
+        indices_bytes - indptr_bytes,
+        static_cast<ptrdiff_t>((vectors->num_vectors() + 1) * sizeof(idx_t)));
+}
+
+// A stream has no file to map, so the flag alone must not send read_index down
+// the mapped path.
+TEST(SeismicSQIndexMmapIOSingle,
+     buffered_read_copies_even_when_the_flag_is_set) {
+    auto source = built_index(QuantizerType::QT_8bit);
+
+    BufferedIOWriter writer;
+    write_index(source.get(), &writer);
+
+    BufferedIOReader reader(writer.data());
+    std::unique_ptr<Index> loaded(read_index(&reader, IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    const auto* vectors = loaded->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    EXPECT_EQ(vectors->num_vectors(), 4);
+    // Copied out, so nothing points into the writer's buffer.
+    const auto* base = writer.data().data();
+    const auto* end = base + writer.data().size();
+    const auto* indptr =
+        reinterpret_cast<const uint8_t*>(vectors->indptr_data());
+    EXPECT_TRUE(indptr < base || indptr >= end);
+}
+
+TEST(SeismicSQIndexMmapIOSingle, mapped_read_of_an_empty_index) {
+    TempIndexFile file("nsparse_sesq_empty_mapped.idx");
+    SeismicScalarQuantizedIndex source(QuantizerType::QT_16bit, 0.25F, 2.0F,
+                                       {.lambda = 10, .beta = 2, .alpha = 0.5F},
+                                       5);
+    write_index(&source, file.c_str());
+
+    std::unique_ptr<Index> loaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->get_vectors(), nullptr);
+    const auto* loaded_sq =
+        dynamic_cast<SeismicScalarQuantizedIndex*>(loaded.get());
+    ASSERT_NE(loaded_sq, nullptr);
+    EXPECT_EQ(loaded_sq->get_scalar_quantizer().get_quantizer_type(),
+              QuantizerType::QT_16bit);
+    EXPECT_FLOAT_EQ(loaded_sq->get_scalar_quantizer().get_min(), 0.25F);
+    EXPECT_FLOAT_EQ(loaded_sq->get_scalar_quantizer().get_max(), 2.0F);
+}
+
+// A mapped CSR is borrowed at the width it was written in, which is float, so
+// this index cannot take that path: its values have to be quantized by add().
+TEST(SeismicSQIndexMmapIOSingle, read_csr_rejects_the_mapped_residency) {
+    SeismicScalarQuantizedIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                      {.lambda = 10, .beta = 2, .alpha = 0.5F},
+                                      5);
+    EXPECT_THROW(index.read_csr("does_not_matter.csr", Residency::kMmap),
+                 std::invalid_argument);
 }
 
 }  // namespace
