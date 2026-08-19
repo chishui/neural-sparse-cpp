@@ -45,8 +45,10 @@ private:
     void write_index(IOWriter* io_writer) override;
     void read_index(IOReader* io_reader, int io_flags) override;
 
+    // `id_selector` (may be null) restricts results to member doc ids.
     auto single_query(const term_t* indices, const float* values, int size,
-                      int k) -> pair_of_score_id_vector_t;
+                      int k, const IDSelector* id_selector)
+        -> pair_of_score_id_vector_t;
     std::unique_ptr<ArrayInvertedLists> inverted_lists_;
     std::unique_ptr<SparseVectors> vectors_;
     // Per-term max posting value, computed at build() time.

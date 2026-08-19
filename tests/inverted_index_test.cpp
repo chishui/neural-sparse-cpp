@@ -14,6 +14,7 @@
 #include <map>
 #include <vector>
 
+#include "nsparse/id_selector.h"
 #include "nsparse/index.h"
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/io/index_io.h"
@@ -462,6 +463,213 @@ TEST(InvertedIndexSearch, search_multi_window_no_crash) {
     for (int i = 1; i < kTopK; ++i) {
         EXPECT_GE(distances[i - 1], distances[i]);
     }
+}
+
+// ============== IDSelector tests ==============
+
+TEST(InvertedIndexSearch, search_with_id_selector_filters_results) {
+    InvertedIndex index(3);
+    Index* idx = &index;
+
+    // doc0: term0=0.3, doc1: term0=1.0, doc2: term0=0.5
+    add_docs(index, {{{0, 0.3F}}, {{0, 1.0F}}, {{0, 0.5F}}});
+    index.build();
+
+    // Only allow doc0 and doc2.
+    std::vector<idx_t> allowed_ids = {0, 2};
+    SetIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    SearchParameters params;
+    params.set_id_selector(&selector);
+
+    std::vector<idx_t> query_indptr = {0, 1};
+    std::vector<term_t> query_indices = {0};
+    std::vector<float> query_values = {1.0F};
+    std::vector<idx_t> labels(3, -1);
+    std::vector<float> distances(3, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 3, distances.data(), labels.data(),
+                &params);
+
+    // doc1 (highest score 1.0) is filtered out.
+    EXPECT_EQ(labels[0], 2);
+    EXPECT_EQ(labels[1], 0);
+    EXPECT_EQ(labels[2], -1);
+    EXPECT_FLOAT_EQ(distances[0], 0.5F);
+    EXPECT_FLOAT_EQ(distances[1], 0.3F);
+}
+
+// The selector is read off the SearchParameters base, so callers may pass any
+// subclass (the JNI layer hands over a seismic-flavored one).
+TEST(InvertedIndexSearch,
+     search_honors_selector_on_search_parameters_subclass) {
+    struct DerivedSearchParameters : SearchParameters {};
+
+    InvertedIndex index(3);
+    Index* idx = &index;
+
+    add_docs(index, {{{0, 0.3F}}, {{0, 1.0F}}, {{0, 0.5F}}});
+    index.build();
+
+    std::vector<idx_t> allowed_ids = {0};
+    SetIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    DerivedSearchParameters params;
+    params.set_id_selector(&selector);
+
+    std::vector<idx_t> query_indptr = {0, 1};
+    std::vector<term_t> query_indices = {0};
+    std::vector<float> query_values = {1.0F};
+    std::vector<idx_t> labels(3, -1);
+    std::vector<float> distances(3, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 3, distances.data(), labels.data(),
+                &params);
+
+    EXPECT_EQ(labels[0], 0);
+    EXPECT_EQ(labels[1], -1);
+    EXPECT_EQ(labels[2], -1);
+}
+
+TEST(InvertedIndexSearch, search_with_id_selector_matching_nothing) {
+    InvertedIndex index(3);
+    Index* idx = &index;
+
+    add_docs(index, {{{0, 0.3F}}, {{0, 1.0F}}});
+    index.build();
+
+    // No id in the selector exists in the index.
+    std::vector<idx_t> allowed_ids = {7, 8};
+    SetIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    SearchParameters params;
+    params.set_id_selector(&selector);
+
+    std::vector<idx_t> query_indptr = {0, 1};
+    std::vector<term_t> query_indices = {0};
+    std::vector<float> query_values = {1.0F};
+    std::vector<idx_t> labels(2, -1);
+    std::vector<float> distances(2, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 2, distances.data(), labels.data(),
+                &params);
+
+    EXPECT_EQ(labels[0], -1);
+    EXPECT_EQ(labels[1], -1);
+}
+
+// A plain (non-enumerable) IDSelector must work too — filtering happens through
+// is_member, not by enumerating ids.
+TEST(InvertedIndexSearch, search_with_non_enumerable_id_selector) {
+    InvertedIndex index(3);
+    Index* idx = &index;
+
+    add_docs(index, {{{0, 0.3F}}, {{0, 1.0F}}, {{0, 0.5F}}});
+    index.build();
+
+    std::vector<idx_t> denied_ids = {1};
+    SetIDSelector denied(denied_ids.size(), denied_ids.data());
+    NotIDSelector selector(&denied);
+    SearchParameters params;
+    params.set_id_selector(&selector);
+
+    std::vector<idx_t> query_indptr = {0, 1};
+    std::vector<term_t> query_indices = {0};
+    std::vector<float> query_values = {1.0F};
+    std::vector<idx_t> labels(3, -1);
+    std::vector<float> distances(3, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 3, distances.data(), labels.data(),
+                &params);
+
+    EXPECT_EQ(labels[0], 2);
+    EXPECT_EQ(labels[1], 0);
+    EXPECT_EQ(labels[2], -1);
+}
+
+// Filtering must hold on the multi-term path, where the excluded doc would
+// otherwise set the heap threshold and where non-essential terms are only
+// scored for candidates that survive.
+TEST(InvertedIndexSearch, search_with_id_selector_multi_term) {
+    InvertedIndex index(4);
+    Index* idx = &index;
+
+    // doc0: 1.4, doc1: 0.8, doc2: 0.72 for the query below.
+    add_docs(index, {{{0, 1.0F}, {1, 0.5F}},
+                     {{0, 0.8F}, {2, 0.6F}},
+                     {{1, 0.9F}, {3, 0.7F}}});
+    index.build();
+
+    std::vector<idx_t> allowed_ids = {1, 2};
+    SetIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    SearchParameters params;
+    params.set_id_selector(&selector);
+
+    std::vector<idx_t> query_indptr = {0, 2};
+    std::vector<term_t> query_indices = {0, 1};
+    std::vector<float> query_values = {1.0F, 0.8F};
+    std::vector<idx_t> labels(3, -1);
+    std::vector<float> distances(3, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 3, distances.data(), labels.data(),
+                &params);
+
+    EXPECT_EQ(labels[0], 1);
+    EXPECT_EQ(labels[1], 2);
+    EXPECT_EQ(labels[2], -1);
+    EXPECT_FLOAT_EQ(distances[0], 0.8F);
+    EXPECT_FLOAT_EQ(distances[1], 0.72F);
+}
+
+// Docs spread over several scoring windows, with allowed ids in each, so the
+// filter is exercised alongside window advancement and re-partitioning.
+TEST(InvertedIndexSearch, search_with_id_selector_multi_window) {
+    constexpr int kDim = 2;
+    constexpr int kNumDocs = 6000;  // > kScoreWindowSize (4096)
+    InvertedIndex index(kDim);
+
+    std::vector<std::map<int, float>> docs;
+    docs.reserve(kNumDocs);
+    for (int i = 0; i < kNumDocs; ++i) {
+        std::map<int, float> doc;
+        doc[0] = 0.1F + static_cast<float>(i % 10) * 0.01F;
+        if (i % 3 == 0) {
+            doc[1] = 0.5F + static_cast<float>(i % 7) * 0.05F;
+        }
+        docs.push_back(doc);
+    }
+    add_docs(index, docs);
+    index.build();
+
+    std::vector<idx_t> allowed_ids = {5, 4095, 4096, 4099, 5999};
+    SetIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    SearchParameters params;
+    params.set_id_selector(&selector);
+
+    std::vector<idx_t> query_indptr = {0, 2};
+    std::vector<term_t> query_indices = {0, 1};
+    std::vector<float> query_values = {1.0F, 1.0F};
+
+    constexpr int kTopK = 10;
+    std::vector<idx_t> labels(kTopK, -1);
+    std::vector<float> distances(kTopK, -1.0F);
+
+    Index* idx = &index;
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), kTopK, distances.data(), labels.data(),
+                &params);
+
+    int found = 0;
+    for (int i = 0; i < kTopK; ++i) {
+        if (labels[i] == -1) {
+            continue;
+        }
+        ++found;
+        EXPECT_TRUE(selector.is_member(labels[i])) << "doc " << labels[i];
+    }
+    EXPECT_EQ(found, static_cast<int>(allowed_ids.size()));
 }
 
 }  // namespace
