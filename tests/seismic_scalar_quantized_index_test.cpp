@@ -11,12 +11,18 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
+#include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
@@ -822,7 +828,9 @@ TEST(SeismicSQIndexSearch, search_with_id_selector_filters_results) {
 }
 
 // Parameters carrying no cut / heap factor fall back to the defaults, as they
-// do for SeismicIndex, rather than being rejected or dereferenced as null.
+// do for SeismicIndex, rather than being rejected or dereferenced as null. Null
+// used to throw here; the results it now returns must be the default ones, not
+// merely non-empty.
 TEST(SeismicSQIndexSearch, search_without_seismic_parameters_uses_defaults) {
     TestableSeismicSQIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 2,
                                  0.5F, 3);
@@ -834,20 +842,24 @@ TEST(SeismicSQIndexSearch, search_without_seismic_parameters_uses_defaults) {
     std::vector<idx_t> query_indptr = {0, 1};
     std::vector<term_t> query_indices = {0};
     std::vector<float> query_values = {1.0F};
-    std::vector<idx_t> labels(1, -1);
-    std::vector<float> distances(1, -1.0F);
 
-    idx->search(1, query_indptr.data(), query_indices.data(),
-                query_values.data(), 1, distances.data(), labels.data(),
-                nullptr);
-    EXPECT_EQ(labels[0], 0);
+    auto search_with = [&](SearchParameters* params) {
+        std::vector<idx_t> labels(2, INVALID_IDX);
+        std::vector<float> distances(2, -1.0F);
+        idx->search(1, query_indptr.data(), query_indices.data(),
+                    query_values.data(), 2, distances.data(), labels.data(),
+                    params);
+        return std::make_pair(distances, labels);
+    };
 
+    SeismicSearchParameters explicit_defaults;
+    const auto expected = search_with(&explicit_defaults);
+    EXPECT_EQ(expected.second[0], 0);
+
+    EXPECT_EQ(search_with(nullptr), expected);
+    // An id selector holder, carrying no cut / heap factor of its own.
     SearchParameters plain_params;
-    labels[0] = -1;
-    idx->search(1, query_indptr.data(), query_indices.data(),
-                query_values.data(), 1, distances.data(), labels.data(),
-                &plain_params);
-    EXPECT_EQ(labels[0], 0);
+    EXPECT_EQ(search_with(&plain_params), expected);
 }
 
 // ============== mapped read_index tests ==============
@@ -955,6 +967,75 @@ size_t count_mappings_of(const std::string& path) {
     return count;
 }
 #endif
+
+#if !defined(_WIN32)
+// Pins NSPARSE_MMAP_ADVISE for a test that depends on how the file is mapped,
+// and restores whatever the environment had.
+class ScopedMmapAdvise {
+public:
+    explicit ScopedMmapAdvise(const char* mode) {
+        const char* previous = std::getenv(kVariable);
+        if (previous != nullptr) {
+            previous_ = previous;
+        }
+        ::setenv(kVariable, mode, 1);
+    }
+    ~ScopedMmapAdvise() {
+        if (previous_.has_value()) {
+            ::setenv(kVariable, previous_->c_str(), 1);
+        } else {
+            ::unsetenv(kVariable);
+        }
+    }
+
+    ScopedMmapAdvise(const ScopedMmapAdvise&) = delete;
+    ScopedMmapAdvise& operator=(const ScopedMmapAdvise&) = delete;
+
+private:
+    static constexpr const char* kVariable = "NSPARSE_MMAP_ADVISE";
+    std::optional<std::string> previous_;
+};
+#endif
+
+// Where read_index leaves off before the payload: the fourcc and the dimension.
+// SESQ's payload opens with the quantizer header write_header wrote.
+constexpr size_t kQuantizerTypeOffset = sizeof(uint32_t) + sizeof(int);
+constexpr size_t kVminOffset = kQuantizerTypeOffset + sizeof(QuantizerType);
+
+template <class T>
+T read_field(const std::string& path, size_t offset) {
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(offset));
+    T value{};
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return value;
+}
+
+// A load-time guard rejects what the writer cannot produce, so the only way to
+// reach one is to overwrite a field of an otherwise valid file in place.
+template <class T>
+void patch_field(const std::string& path, size_t offset, T value) {
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    out.seekp(static_cast<std::streamoff>(offset));
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+// Both readers of a corrupted file, each of which has to reject it on its own.
+// The message is checked, not just the type: reading on past a guard that was
+// dropped throws too, somewhere downstream, and that must not read as a pass.
+template <class Error>
+void expect_both_reads_rejected(char* path, const char* fragment) {
+    for (const int flags : {0, static_cast<int>(IndexIoFlag::kUseMmap)}) {
+        try {
+            std::unique_ptr<Index> loaded(read_index(path, flags));
+            ADD_FAILURE() << "accepted the file, flags " << flags;
+        } catch (const Error& error) {
+            EXPECT_NE(std::string(error.what()).find(fragment),
+                      std::string::npos)
+                << "flags " << flags << ": " << error.what();
+        }
+    }
+}
 
 }  // namespace
 
@@ -1089,6 +1170,61 @@ TEST_P(SeismicSQIndexMmapIO, copying_read_consumes_exactly_what_was_written) {
     EXPECT_EQ(reader.pos(), written);
 }
 
+// bytes_per_value() reads anything that is not QT_8bit as 16-bit, so an
+// undefined type would pick an element width instead of being rejected, and the
+// codes behind it would be strided at that width. Both readers parse the
+// quantizer header themselves, so the guard has to hold on both.
+TEST_P(SeismicSQIndexMmapIO, both_reads_reject_an_unknown_quantizer_type) {
+    TempIndexFile file("nsparse_sesq_unknown_type.idx");
+    auto source = built_index(GetParam());
+    write_index(source.get(), file.c_str());
+    const std::string path = file.c_str();
+
+    // Fails loudly if the layout moves, rather than patching some other field.
+    ASSERT_EQ(read_field<QuantizerType>(path, kQuantizerTypeOffset),
+              GetParam());
+    patch_field(path, kQuantizerTypeOffset, static_cast<QuantizerType>(2));
+
+    expect_both_reads_rejected<std::runtime_error>(file.c_str(),
+                                                  "unknown quantizer type");
+}
+
+// A type that is a valid enum but not the width the values were encoded at:
+// search would stride the stored codes at the quantizer's width and read past
+// the end of the array, or halfway into each code.
+TEST_P(SeismicSQIndexMmapIO, both_reads_reject_a_type_the_stored_width_denies) {
+    TempIndexFile file("nsparse_sesq_width_mismatch.idx");
+    auto source = built_index(GetParam());
+    write_index(source.get(), file.c_str());
+    const std::string path = file.c_str();
+
+    ASSERT_EQ(read_field<QuantizerType>(path, kQuantizerTypeOffset),
+              GetParam());
+    const auto other_width = GetParam() == QuantizerType::QT_8bit
+                                 ? QuantizerType::QT_16bit
+                                 : QuantizerType::QT_8bit;
+    patch_field(path, kQuantizerTypeOffset, other_width);
+
+    expect_both_reads_rejected<std::runtime_error>(
+        file.c_str(), "element size disagrees with its quantizer type");
+}
+
+// The stored range reaches the quantizer's constructor, which is what rejects a
+// NaN bound -- an ordered comparison cannot, and the range would then decode
+// every score to NaN while the labels still looked ordered.
+TEST_P(SeismicSQIndexMmapIO, both_reads_reject_a_non_finite_quantizer_range) {
+    TempIndexFile file("nsparse_sesq_nan_range.idx");
+    auto source = built_index(GetParam());
+    write_index(source.get(), file.c_str());
+    const std::string path = file.c_str();
+
+    ASSERT_FLOAT_EQ(read_field<float>(path, kVminOffset), 0.0F);
+    patch_field(path, kVminOffset, std::numeric_limits<float>::quiet_NaN());
+
+    expect_both_reads_rejected<std::invalid_argument>(file.c_str(),
+                                                     "must be finite");
+}
+
 // The point of the mapped path: the arrays point into the file, not into fresh
 // allocations.
 TEST(SeismicSQIndexMmapIOSingle, mapped_read_borrows_from_the_file) {
@@ -1162,6 +1298,13 @@ TEST(SeismicSQIndexMmapIOSingle, mapped_read_of_an_empty_index) {
 // account: a mapping kept alive by a stray copy, or an fd left open, only shows
 // up as a process that grows until it cannot open another index.
 TEST(SeismicSQIndexMmapIOSingle, mapped_index_releases_the_mapping_and_the_fd) {
+#if !defined(_WIN32)
+    // Both checks below assume a mapping of the file. The "hugetlb" advise mode
+    // copies the file into an anonymous region instead, which the kernel does
+    // not report as a mapping of the path at all, so an ambient
+    // NSPARSE_MMAP_ADVISE would turn the count into a false failure.
+    const ScopedMmapAdvise advise("hugepage");
+#endif
     TempIndexFile file("nsparse_sesq_release.idx");
     auto source = built_index(QuantizerType::QT_8bit);
     write_index(source.get(), file.c_str());

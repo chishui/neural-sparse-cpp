@@ -71,6 +71,10 @@ private:
     void write_header(IOWriter* io_writer);
     void read_header(IOReader* io_reader);
 
+    // Null `search_parameters` searches with the defaults, as it does for
+    // SeismicIndex and as the base signature's default argument implies. This
+    // index used to reject it, which made that default argument -- and the
+    // bindings' params=None -- unusable here alone.
     auto search(idx_t n, const idx_t* indptr, const term_t* indices,
                 const float* values, int k,
                 SearchParameters* search_parameters = nullptr)

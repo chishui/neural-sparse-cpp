@@ -50,6 +50,23 @@ TEST(ScalarQuantizer, constructor_throws_when_vmax_less_than_vmin) {
                  std::invalid_argument);
 }
 
+// A NaN bound slips past vmax <= vmin, and an infinite range divides to zero.
+// Neither is rejected by an ordered comparison, and both poison every code and
+// every decoded score rather than failing outright.
+TEST(ScalarQuantizer, constructor_throws_when_a_bound_is_not_finite) {
+    constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+
+    ASSERT_THROW(ScalarQuantizer(QuantizerType::QT_8bit, kNaN, 1.0F),
+                 std::invalid_argument);
+    ASSERT_THROW(ScalarQuantizer(QuantizerType::QT_8bit, 0.0F, kNaN),
+                 std::invalid_argument);
+    ASSERT_THROW(ScalarQuantizer(QuantizerType::QT_16bit, kNaN, kNaN),
+                 std::invalid_argument);
+    ASSERT_THROW(ScalarQuantizer(QuantizerType::QT_16bit, -kInf, kInf),
+                 std::invalid_argument);
+}
+
 // bytes_per_value tests
 TEST(ScalarQuantizer, bytes_per_value_8bit) {
     ScalarQuantizer sq(QuantizerType::QT_8bit, 0.0F, 1.0F);

@@ -11,10 +11,13 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <random>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -915,6 +918,46 @@ std::vector<idx_t> search_top(Index* index, term_t term, int k) {
     return labels;
 }
 
+// SparseVectors' element_size, counting past the fourcc and dimension
+// read_index consumes and past the vector count and dimension serialize()
+// wrote ahead of it.
+constexpr size_t kElementSizeOffset =
+    sizeof(uint32_t) + sizeof(int) + (2 * sizeof(size_t));
+
+template <class T>
+T read_field(const std::string& path, size_t offset) {
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(offset));
+    T value{};
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return value;
+}
+
+// The load-time guard rejects what the writer cannot produce, so the only way
+// to reach it is to overwrite a field of an otherwise valid file in place.
+template <class T>
+void patch_field(const std::string& path, size_t offset, T value) {
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    out.seekp(static_cast<std::streamoff>(offset));
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+// Both readers of a corrupted file, each of which has to reject it on its own.
+// The message is checked, not just the type: reading on past a guard that was
+// dropped throws too, somewhere downstream, and that must not read as a pass.
+void expect_both_reads_rejected(char* path, const char* fragment) {
+    for (const int flags : {0, static_cast<int>(IndexIoFlag::kUseMmap)}) {
+        try {
+            std::unique_ptr<Index> loaded(read_index(path, flags));
+            ADD_FAILURE() << "accepted the file, flags " << flags;
+        } catch (const std::runtime_error& error) {
+            EXPECT_NE(std::string(error.what()).find(fragment),
+                      std::string::npos)
+                << "flags " << flags << ": " << error.what();
+        }
+    }
+}
+
 }  // namespace
 
 TEST(SeismicIndexMmapIO, mapped_read_matches_the_copying_read) {
@@ -983,6 +1026,24 @@ TEST(SeismicIndexMmapIO, buffered_read_copies_even_when_the_flag_is_set) {
     const auto* indptr =
         reinterpret_cast<const uint8_t*>(vectors->indptr_data());
     EXPECT_TRUE(indptr < base || indptr >= end);
+}
+
+// The values are read back as float, at the width add() encoded them with, so
+// a file declaring another width would be strided past the end of the array or
+// halfway into each value. Only a corrupt file can say so, and both readers
+// take the field from the file themselves.
+TEST(SeismicIndexMmapIO, both_reads_reject_a_foreign_stored_element_width) {
+    TempIndexFile file("nsparse_seis_element_width.idx");
+    auto source = built_index();
+    write_index(source.get(), file.c_str());
+    const std::string path = file.c_str();
+
+    // Fails loudly if the layout moves, rather than patching some other field.
+    ASSERT_EQ(read_field<size_t>(path, kElementSizeOffset), size_t{U32});
+    patch_field(path, kElementSizeOffset, size_t{U16});
+
+    expect_both_reads_rejected(file.c_str(),
+                               "element size is not the seismic index's");
 }
 
 TEST(SeismicIndexMmapIO, mapped_read_of_an_empty_index) {

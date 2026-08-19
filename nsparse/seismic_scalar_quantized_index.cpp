@@ -42,7 +42,7 @@ namespace {
 
 // A quantizer described by an index file. bytes_per_value() treats anything but
 // QT_8bit as 16-bit, so an undefined type would silently pick an element width
-// rather than be rejected; the constructor covers vmax <= vmin.
+// rather than be rejected; the constructor covers a non-finite or empty range.
 ScalarQuantizer quantizer_from_file(QuantizerType type, float vmin,
                                     float vmax) {
     if (type != QuantizerType::QT_8bit && type != QuantizerType::QT_16bit) {
