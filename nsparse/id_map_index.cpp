@@ -63,6 +63,10 @@ const SparseVectors* IDMapIndex::get_vectors() const {
     return delegate_ == nullptr ? nullptr : delegate_->get_vectors();
 }
 
+size_t IDMapIndex::num_vectors() const {
+    return delegate_ == nullptr ? 0 : delegate_->num_vectors();
+}
+
 void IDMapIndex::add_with_ids(idx_t n, const idx_t* indptr,
                               const term_t* indices, const float* values,
                               const idx_t* ids) {

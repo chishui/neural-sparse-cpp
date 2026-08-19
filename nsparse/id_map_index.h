@@ -91,6 +91,9 @@ public:
                 const float* values, int k, float* distances, idx_t* labels,
                 SearchParameters* search_parameters = nullptr) override;
     const SparseVectors* get_vectors() const override;
+    // Delegated rather than inherited: the delegate may report a count without
+    // exposing its vectors.
+    size_t num_vectors() const override;
 
     void add_with_ids(idx_t n, const idx_t* indptr, const term_t* indices,
                       const float* values, const idx_t* ids) override;

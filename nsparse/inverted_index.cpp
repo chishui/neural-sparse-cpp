@@ -229,6 +229,7 @@ void InvertedIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
     vectors_->add_vectors(indptr, indptr_size, indices, nnz,
                           reinterpret_cast<const uint8_t*>(values),
                           nnz * kElementSize);
+    num_vectors_ += n;
 }
 
 void InvertedIndex::build() {
@@ -414,6 +415,10 @@ void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
                 io_reader->read(codes.data(), sizeof(uint8_t), codes_size);
                 inverted_lists_->add_entries(static_cast<term_t>(i), list_size,
                                              doc_ids.data(), codes.data());
+                // Doc ids are assigned sequentially from 0 by add(), and the
+                // format stores no count, so the highest id recovers it.
+                num_vectors_ = std::max(
+                    num_vectors_, static_cast<size_t>(doc_ids.back()) + 1);
             }
         }
     }
