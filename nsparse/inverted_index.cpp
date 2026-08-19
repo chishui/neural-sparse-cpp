@@ -179,13 +179,16 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
 
             idx_t doc = window_base + slot;
 
-            // Filtered-out docs must not reach the heap, and must not raise the
-            // threshold either — skip before any scoring work.
-            if (id_selector != nullptr && !id_selector->is_member(doc)) {
+            if (essential_score + non_essential_sum <= threshold) {
                 continue;
             }
 
-            if (essential_score + non_essential_sum <= threshold) {
+            // Filtered-out docs must not reach the heap, and must not raise the
+            // threshold either — skip before the non-essential terms are
+            // scored. Ordered after the bound check because is_member costs a
+            // virtual call plus a set probe, while the bound check is two
+            // arithmetic ops; both are pure skips, so the order is free.
+            if (id_selector != nullptr && !id_selector->is_member(doc)) {
                 continue;
             }
 
