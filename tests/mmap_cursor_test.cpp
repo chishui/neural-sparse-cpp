@@ -30,9 +30,8 @@ std::vector<uint32_t> make_buffer(size_t words) {
 }
 
 nsparse::MmapCursor cursor_over(const std::vector<uint32_t>& buffer) {
-    return nsparse::MmapCursor(
-        reinterpret_cast<const uint8_t*>(buffer.data()),
-        buffer.size() * sizeof(uint32_t));
+    return nsparse::MmapCursor(reinterpret_cast<const uint8_t*>(buffer.data()),
+                               buffer.size() * sizeof(uint32_t));
 }
 
 TEST(MmapCursor, ReadsScalarsAndArraysInSequence) {
@@ -55,8 +54,8 @@ TEST(MmapCursor, RejectsAnArrayLongerThanTheMapping) {
 }
 
 // A count whose product with sizeof(T) wraps to a handful of bytes: a bounds
-// check on the product passes, and the caller gets a view over ~2^62 elements of
-// a 16-byte mapping.
+// check on the product passes, and the caller gets a view over ~2^62 elements
+// of a 16-byte mapping.
 TEST(MmapCursor, RejectsACountThatOverflowsTheByteSize) {
     const auto buffer = make_buffer(4);
     auto cursor = cursor_over(buffer);
@@ -101,6 +100,19 @@ TEST(MmapCursor, AnEmptyArrayIsNullAndConsumesNothing) {
     auto cursor = cursor_over(buffer);
     EXPECT_EQ(cursor.read_array<uint32_t>(0), nullptr);
     EXPECT_EQ(cursor.pos(), 0U);
+}
+
+TEST(MmapCursor, CurrentPointsAtThePosition) {
+    const auto buffer = make_buffer(4);
+    auto cursor = cursor_over(buffer);
+    const auto* base = reinterpret_cast<const uint8_t*>(buffer.data());
+    const size_t size = buffer.size() * sizeof(uint32_t);
+    EXPECT_EQ(cursor.current(), base);
+    cursor.read_scalar<uint32_t>();
+    EXPECT_EQ(cursor.current(), base + sizeof(uint32_t));
+    cursor.skip(cursor.remaining());  // one-past-end pointer is formed, never
+                                      // dereferenced
+    EXPECT_EQ(cursor.current(), base + size);
 }
 
 }  // namespace

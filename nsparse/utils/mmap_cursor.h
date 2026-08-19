@@ -73,6 +73,11 @@ public:
         pos_ += bytes;
     }
 
+    // Pointer at the current position, non-mutating: lets a caller record where
+    // a borrowed section begins before consuming it (e.g. a length-prefixed
+    // component borrows [current(), current() + section_len) then skip()s it).
+    [[nodiscard]] const uint8_t* current() const { return data_ + pos_; }
+
     [[nodiscard]] size_t pos() const { return pos_; }
     [[nodiscard]] size_t remaining() const { return size_ - pos_; }
 
