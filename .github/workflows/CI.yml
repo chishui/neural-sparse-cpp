@@ -127,7 +127,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install build dependencies
-        run: python -m pip install --upgrade pip "numpy<2.0" packaging setuptools wheel
+        run: python -m pip install --upgrade pip "numpy<2.0" packaging setuptools wheel pytest
 
       - name: Configure
         run: |
@@ -151,19 +151,12 @@ jobs:
       - name: Import check
         run: python -c "import nsparse; print(nsparse.index_factory)"
 
+      # pytest, not a loop over `python <file>`: the loop only caught a nonzero
+      # exit, so a test that computed a wrong answer without asserting passed.
+      # -rX surfaces xpasses, which is how a fixed known-issue test announces
+      # that its xfail marker should be removed.
       - name: Run Python tests
-        run: |
-          shopt -s nullglob
-          tests=(python_tests/*.py)
-          if [ ${#tests[@]} -eq 0 ]; then
-            echo "No tests found in python_tests/" >&2
-            exit 1
-          fi
-          for test in "${tests[@]}"; do
-            echo "::group::$test"
-            python "$test"
-            echo "::endgroup::"
-          done
+        run: python -m pytest python_tests -v -rX
 
   Build-nsparse-MacOS:
     name: Build and Test nsparse on MacOS
