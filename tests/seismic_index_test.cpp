@@ -911,7 +911,7 @@ std::vector<idx_t> search_top(Index* index, term_t term, int k) {
     std::vector<idx_t> indptr = {0, 1};
     std::vector<term_t> indices = {term};
     std::vector<float> values = {1.0F};
-    std::vector<idx_t> labels(k, INVALID_IDX);
+    std::vector<idx_t> labels(k, detail::INVALID_IDX);
     std::vector<float> distances(k, -1.0F);
     index->search(1, indptr.data(), indices.data(), values.data(), k,
                   distances.data(), labels.data());

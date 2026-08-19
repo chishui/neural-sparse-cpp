@@ -137,7 +137,7 @@ float compute_recall(const std::vector<idx_t>& predicted,
     std::set<idx_t> gt_set(ground_truth.begin(), ground_truth.end());
     int hits = 0;
     for (auto id : predicted) {
-        if (id != INVALID_IDX && gt_set.count(id)) {
+        if (id != detail::INVALID_IDX && gt_set.count(id)) {
             ++hits;
         }
     }
@@ -178,7 +178,7 @@ TEST_P(InvertedIndexRecallTest, recall_should_be_perfect) {
             q_values.push_back(v);
         }
 
-        std::vector<idx_t> labels(k, INVALID_IDX);
+        std::vector<idx_t> labels(k, detail::INVALID_IDX);
         std::vector<float> distances(k, -1.0F);
 
         idx->search(1, q_indptr.data(), q_indices.data(), q_values.data(), k,

@@ -545,7 +545,7 @@ TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
     std::vector<nsparse::idx_t> q_indptr = {0, 1};
     std::vector<nsparse::term_t> q_indices = {0};
     std::vector<float> q_values = {1.0F};
-    std::vector<nsparse::idx_t> labels(1, nsparse::INVALID_IDX);
+    std::vector<nsparse::idx_t> labels(1, nsparse::detail::INVALID_IDX);
     std::vector<float> distances(1, -1.0F);
     loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
                    distances.data(), labels.data());
@@ -594,7 +594,7 @@ TEST(IndexIO, UseMmapFlagReachesTheIDMapDelegate) {
     std::vector<nsparse::idx_t> q_indptr = {0, 1};
     std::vector<nsparse::term_t> q_indices = {0};
     std::vector<float> q_values = {1.0F};
-    std::vector<nsparse::idx_t> labels(1, nsparse::INVALID_IDX);
+    std::vector<nsparse::idx_t> labels(1, nsparse::detail::INVALID_IDX);
     std::vector<float> distances(1, -1.0F);
     loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
                    distances.data(), labels.data());
@@ -644,7 +644,7 @@ TEST(IndexIO, UseMmapFlagReachesTheIDMapQuantizedDelegate) {
     std::vector<nsparse::idx_t> q_indptr = {0, 1};
     std::vector<nsparse::term_t> q_indices = {0};
     std::vector<float> q_values = {1.0F};
-    std::vector<nsparse::idx_t> labels(1, nsparse::INVALID_IDX);
+    std::vector<nsparse::idx_t> labels(1, nsparse::detail::INVALID_IDX);
     std::vector<float> distances(1, -1.0F);
     nsparse::SeismicSearchParameters params(5, 1.0F);
     loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,

@@ -295,7 +295,7 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
     -> pair_of_score_id_vector_t {
     if (size == 0) {
         std::vector<float> scores(k, -1.0F);
-        std::vector<idx_t> ids(k, INVALID_IDX);
+        std::vector<idx_t> ids(k, detail::INVALID_IDX);
         return {scores, ids};
     }
 
@@ -358,7 +358,7 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
 
     auto [result_scores, ids] = heap.top_k_items_descending();
     result_scores.resize(k, -1.0F);
-    ids.resize(k, INVALID_IDX);
+    ids.resize(k, detail::INVALID_IDX);
     return {result_scores, ids};
 }
 

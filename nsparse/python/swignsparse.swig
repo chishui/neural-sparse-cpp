@@ -12,6 +12,8 @@
 %{
 #define SWIG_FILE_WITH_INIT
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <new>
+#include <stdexcept>
 #include <numpy/arrayobject.h>
 #include "nsparse/types.h"
 #include "nsparse/io/io.h"
@@ -36,9 +38,37 @@ import_array();
 %}
 
 %include <std_string.i>
+%include <exception.i>
+
+// SWIG generates no try/catch of its own, so without this every exception that
+// escapes the library reaches std::terminate and kills the interpreter -- an
+// unknown index spec or a non-positive k would abort the process instead of
+// raising. Declared before any wrapped decl so it applies to all of them.
+%exception {
+    try {
+        $action
+    } catch (const std::invalid_argument& e) {
+        SWIG_exception(SWIG_ValueError, e.what());
+    } catch (const std::out_of_range& e) {
+        SWIG_exception(SWIG_IndexError, e.what());
+    } catch (const std::bad_alloc& e) {
+        SWIG_exception(SWIG_MemoryError, e.what());
+    } catch (const std::exception& e) {
+        SWIG_exception(SWIG_RuntimeError, e.what());
+    }
+}
+
 %include "nsparse_typemaps.i"
 %include "factory.i"
+
+// Everything in nsparse::detail is internal. This has to precede every header
+// %include below: %ignore only applies to declarations parsed after it, so
+// placing it lower silently missed the detail symbols in the headers already
+// pulled in -- INVALID_IDX among them, which then surfaced as a useless
+// int32_t* pointer object.
+%ignore nsparse::detail;
 %include "nsparse/io/io.h"
+
 %include "nsparse/types.h"
 
 // read_csr(path, Residency::kMmap) only accepts the native layout, so without a
@@ -95,7 +125,6 @@ import_array();
 %ignore nsparse::SeismicScalarQuantizedIndex::mmap_index;
 %ignore nsparse::InvertedListClusters::serialize;
 %ignore nsparse::InvertedListClusters::deserialize;
-%ignore nsparse::detail; 
 
 // Ignore the protected std::vector-based methods
 %ignore nsparse::Index::add(idx_t, std::vector<idx_t>&, std::vector<term_t>&, std::vector<float>&);

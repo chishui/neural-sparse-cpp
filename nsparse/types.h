@@ -35,7 +35,11 @@ using pair_of_score_id_vector_t_t =
 using pair_of_score_id_vector_t = pair_of_score_id_vector_t_t<idx_t>;
 using pair_of_score_id_vectors_t =
     std::pair<std::vector<std::vector<float>>, std::vector<std::vector<idx_t>>>;
+
+namespace detail {
 constexpr idx_t INVALID_IDX = -1;
+}
+
 }  // namespace nsparse
 
 #endif  // TYPES_H
