@@ -153,6 +153,7 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
                                 const std::vector<float>& max_score_prefix,
                                 std::vector<float>& window_scores,
                                 const uint64_t* bitmap,
+                                const IDSelector* id_selector,
                                 detail::TopKHolder<idx_t>& heap) {
     // Iterate only set bits in the bitmap.
     // Each word covers 64 slots; ctzll finds the next set bit.
@@ -179,6 +180,12 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
             idx_t doc = window_base + slot;
 
             if (essential_score + non_essential_sum <= threshold) {
+                continue;
+            }
+
+            // Filtered docs neither enter the heap nor raise the threshold.
+            // Checked after the cheaper score bound; both are pure skips.
+            if (id_selector != nullptr && !id_selector->is_member(doc)) {
                 continue;
             }
 
@@ -264,13 +271,18 @@ auto InvertedIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
     const auto* query_indices = query_vectors.indices_data();
     const auto* query_values = query_vectors.values_data_float();
 
+    // Read off the base, so any SearchParameters subclass works.
+    const IDSelector* id_selector = search_parameters == nullptr
+                                        ? nullptr
+                                        : search_parameters->get_id_selector();
+
 #pragma omp parallel for
     for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
         const idx_t start = query_indptr[query_idx];
         const size_t len = query_indptr[query_idx + 1] - start;
 
-        auto [distances, labels] =
-            single_query(query_indices + start, query_values + start, len, k);
+        auto [distances, labels] = single_query(
+            query_indices + start, query_values + start, len, k, id_selector);
         result_distances[query_idx] = std::move(distances);
         result_labels[query_idx] = std::move(labels);
     }
@@ -279,7 +291,8 @@ auto InvertedIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
 }
 
 auto InvertedIndex::single_query(const term_t* indices, const float* values,
-                                 int size, int k) -> pair_of_score_id_vector_t {
+                                 int size, int k, const IDSelector* id_selector)
+    -> pair_of_score_id_vector_t {
     if (size == 0) {
         std::vector<float> scores(k, -1.0F);
         std::vector<idx_t> ids(k, INVALID_IDX);
@@ -340,7 +353,7 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
                               window_scores, bitmap);
         evaluate_window_candidates(scorers, first_essential, window_base,
                                    max_score_prefix, window_scores, bitmap,
-                                   heap);
+                                   id_selector, heap);
     }
 
     auto [result_scores, ids] = heap.top_k_items_descending();
