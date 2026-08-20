@@ -20,6 +20,7 @@ from support import (
     K,
     PAD_DIST,
     PAD_LABEL,
+    Corpus,
     make_index,
     roundtrip,
     search,
@@ -55,11 +56,28 @@ def test_persistence_roundtrip(index, corpus, queries, tmp_path):
     """Reloading reproduces the results of the index that wrote the file."""
     before_d, before_l = search(index, queries)
     reloaded = roundtrip(index, tmp_path / "inverted.idx")
-    # The format stores no doc count, so this also covers recovering it.
     assert reloaded.num_vectors() == corpus.n
     after_d, after_l = search(reloaded, queries)
     np.testing.assert_array_equal(after_l, before_l)
     np.testing.assert_allclose(after_d, before_d, rtol=1e-6, atol=1e-6)
+
+
+def test_trailing_empty_document_survives_a_roundtrip(tmp_path):
+    """A term-less document counts, and build() dropping it does not change that.
+
+    It leaves no posting entry, so the count cannot be inferred from the lists;
+    trailing, because an interior gap is bracketed by the ids around it.
+    """
+    empty_last = Corpus(
+        dim=8,
+        n=2,
+        indptr=np.array([0, 2, 2], dtype=np.int32),
+        indices=np.array([0, 1], dtype=np.uint16),
+        values=np.array([1.0, 0.5], dtype=np.float32),
+    )
+    index = make_index(SPEC, empty_last)
+    assert index.num_vectors() == 2
+    assert roundtrip(index, tmp_path / "empty_last.idx").num_vectors() == 2
 
 
 def test_with_id_map(corpus, queries, oracle, doc_ids):

@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "nsparse/sparse_vectors.h"
@@ -364,6 +365,12 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
 }
 
 void InvertedIndex::write_index(IOWriter* io_writer) {
+    // The document count, which the posting lists do not carry: a document
+    // whose terms were all pruned, or that ends the corpus with none, leaves no
+    // entry to recover it from.
+    size_t num_vectors = num_vectors_;
+    io_writer->write(&num_vectors, sizeof(size_t), 1);
+
     // Write inverted lists
     size_t n_terms = inverted_lists_ ? inverted_lists_->size() : 0;
     io_writer->write(&n_terms, sizeof(size_t), 1);
@@ -395,11 +402,22 @@ void InvertedIndex::write_index(IOWriter* io_writer) {
 }
 
 void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
+    io_reader->read(&num_vectors_, sizeof(size_t), 1);
+
     // Read inverted lists
     size_t n_terms = 0;
     io_reader->read(&n_terms, sizeof(size_t), 1);
     size_t element_size = 0;
     io_reader->read(&element_size, sizeof(size_t), 1);
+    // write_index only ever writes kElementSize, so another width means a file
+    // this reader cannot parse -- in particular one written before the document
+    // count above, whose fields all land one slot early. The width also sets
+    // how many code bytes each list holds, so reading on desynchronizes the
+    // stream instead of failing.
+    if (element_size != kElementSize) {
+        throw std::runtime_error(
+            "inverted index file declares an unsupported element width");
+    }
 
     if (n_terms > 0) {
         inverted_lists_ =
@@ -415,10 +433,6 @@ void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
                 io_reader->read(codes.data(), sizeof(uint8_t), codes_size);
                 inverted_lists_->add_entries(static_cast<term_t>(i), list_size,
                                              doc_ids.data(), codes.data());
-                // Doc ids are assigned sequentially from 0 by add(), and the
-                // format stores no count, so the highest id recovers it.
-                num_vectors_ = std::max(
-                    num_vectors_, static_cast<size_t>(doc_ids.back()) + 1);
             }
         }
     }

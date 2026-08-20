@@ -444,9 +444,6 @@ TEST(IndexIO, StrictIO_RoundtripIDMapSeismicIndex) {
 // IDMapIndex wrapping InvertedIndex: the original segfault scenario.
 // InvertedIndex has a non-trivial write_index/read_index, so the stream must
 // stay open for the delegate to be serialized after IDMapIndex's id map.
-// Note: InvertedIndex::get_vectors() returns nullptr after build()
-// (vectors_ is consumed to create inverted_lists_), so num_vectors()
-// returns 0. We verify the roundtrip by checking the index type instead.
 TEST(IndexIO, StrictIO_RoundtripIDMapInvertedIndex) {
     auto* inverted = new nsparse::InvertedIndex(128);
     auto* original = new nsparse::IDMapIndex(inverted);
@@ -468,9 +465,60 @@ TEST(IndexIO, StrictIO_RoundtripIDMapInvertedIndex) {
 
     ASSERT_NE(loaded, nullptr);
     ASSERT_EQ(loaded->id(), original->id());
+    ASSERT_EQ(loaded->num_vectors(), 2);
 
     delete original;
     delete loaded;
+}
+
+// A document whose terms were all pruned -- here, one with none to begin with
+// -- leaves no posting entry behind, so the count cannot be recovered from the
+// lists and has to be serialized. Trailing, because an interior gap is still
+// bracketed by the ids around it.
+TEST(IndexIO, RoundtripInvertedIndexCountsATrailingEmptyDocument) {
+    nsparse::InvertedIndex original(128);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 2};
+    std::vector<nsparse::term_t> indices = {0, 1};
+    std::vector<float> values = {1.0F, 0.5F};
+    original.add(2, indptr.data(), indices.data(), values.data());
+    original.build();
+    ASSERT_EQ(original.num_vectors(), 2);
+
+    nsparse::BufferedIOWriter writer;
+    nsparse::write_index(&original, &writer);
+    nsparse::BufferedIOReader reader(writer.data());
+    std::unique_ptr<nsparse::Index> loaded(nsparse::read_index(&reader));
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->num_vectors(), 2);
+}
+
+// The INVT payload has no version to check, so a file written before it carried
+// the document count reads with every field one slot early. The element width
+// is what gives that away: write_index only ever writes U32, and the value
+// landing there instead is the first posting list's size.
+TEST(IndexIO, ReadIndexRejectsAnInvertedIndexFileWithoutTheDocumentCount) {
+    nsparse::InvertedIndex original(128);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    original.add(2, indptr.data(), indices.data(), values.data());
+    original.build();
+
+    nsparse::BufferedIOWriter writer;
+    nsparse::write_index(&original, &writer);
+
+    // The header is a fourcc and a dimension; the count is the payload's first
+    // field, so dropping it is exactly the old layout.
+    std::vector<uint8_t> stale = writer.data();
+    const size_t header = sizeof(uint32_t) + sizeof(int);
+    stale.erase(stale.begin() + header,
+                stale.begin() + header + sizeof(size_t));
+
+    nsparse::BufferedIOReader reader(stale);
+    EXPECT_THROW(nsparse::read_index(&reader), std::runtime_error);
 }
 
 // IDMapIndex wrapping SeismicScalarQuantizedIndex with strict IO
@@ -540,8 +588,8 @@ TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
 
     ASSERT_NE(loaded, nullptr);
     ASSERT_EQ(loaded->id(), original.id());
-    // InvertedIndex consumes its vectors into the posting lists, so the
-    // roundtrip shows up in a search rather than in num_vectors().
+    // InvertedIndex consumes its vectors into the posting lists, so a search is
+    // what shows the postings themselves survived the roundtrip.
     std::vector<nsparse::idx_t> q_indptr = {0, 1};
     std::vector<nsparse::term_t> q_indices = {0};
     std::vector<float> q_values = {1.0F};

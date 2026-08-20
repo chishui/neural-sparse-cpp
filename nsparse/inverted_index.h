@@ -52,9 +52,9 @@ private:
         -> pair_of_score_id_vector_t;
     std::unique_ptr<ArrayInvertedLists> inverted_lists_;
     std::unique_ptr<SparseVectors> vectors_;
-    // Tracked separately: build() releases vectors_, and the serialised format
-    // carries no document count, so it is recovered from the posting lists on
-    // read.
+    // Tracked separately, since build() releases vectors_, and serialised
+    // explicitly, since the posting lists hold no entry for a document whose
+    // terms were all pruned.
     size_t num_vectors_ = 0;
     // Per-term max posting value, computed at build() time.
     // max_term_scores_[term_id] = max value in that term's posting list.
