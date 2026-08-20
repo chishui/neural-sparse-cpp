@@ -522,16 +522,17 @@ private:
 };
 }  // namespace
 
-// Only the seismic index can be mapped, so kUseMmap on any other type has to
-// fall back to the copying read rather than be honoured.
+// Only the seismic indexes have a mapped reader, so kUseMmap on any other type
+// has to fall back to the copying read rather than be honoured.
 TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
-    TempIndexFile file("nsparse_index_io_sq_mmap_flag.idx");
-    nsparse::SeismicScalarQuantizedIndex original(128);
+    TempIndexFile file("nsparse_index_io_inverted_mmap_flag.idx");
+    nsparse::InvertedIndex original(128);
 
     std::vector<nsparse::idx_t> indptr = {0, 2, 4};
     std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
     std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
     original.add(2, indptr.data(), indices.data(), values.data());
+    original.build();
     nsparse::write_index(&original, file.c_str());
 
     std::unique_ptr<nsparse::Index> loaded(
@@ -539,7 +540,16 @@ TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
 
     ASSERT_NE(loaded, nullptr);
     ASSERT_EQ(loaded->id(), original.id());
-    ASSERT_EQ(loaded->num_vectors(), 2);
+    // InvertedIndex consumes its vectors into the posting lists, so the
+    // roundtrip shows up in a search rather than in num_vectors().
+    std::vector<nsparse::idx_t> q_indptr = {0, 1};
+    std::vector<nsparse::term_t> q_indices = {0};
+    std::vector<float> q_values = {1.0F};
+    std::vector<nsparse::idx_t> labels(1, nsparse::INVALID_IDX);
+    std::vector<float> distances(1, -1.0F);
+    loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
+                   distances.data(), labels.data());
+    EXPECT_EQ(labels[0], 0);
 }
 
 // The id map is serialized ahead of the delegate so that a mapped delegate read
@@ -588,5 +598,56 @@ TEST(IndexIO, UseMmapFlagReachesTheIDMapDelegate) {
     std::vector<float> distances(1, -1.0F);
     loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
                    distances.data(), labels.data());
+    EXPECT_EQ(labels[0], 100);
+}
+
+// Same forwarding, with a quantized delegate: its payload opens with the
+// quantizer header, so the mapped reader has to consume that before the
+// vectors.
+TEST(IndexIO, UseMmapFlagReachesTheIDMapQuantizedDelegate) {
+    TempIndexFile file("nsparse_index_io_idmap_sq_mmap.idx");
+    auto* seismic_sq = new nsparse::SeismicScalarQuantizedIndex(
+        nsparse::QuantizerType::QT_8bit, 0.0F, 1.0F,
+        {.lambda = 10, .beta = 2, .alpha = 0.5F}, 5);
+    nsparse::IDMapIndex original(seismic_sq);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original.add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                          ids.data());
+    original.build();
+    nsparse::write_index(&original, file.c_str());
+
+    std::unique_ptr<nsparse::Index> loaded(
+        nsparse::read_index(file.c_str(), nsparse::IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->id(), original.id());
+    ASSERT_EQ(loaded->num_vectors(), 2);
+
+    const auto* vectors = loaded->get_vectors();
+    ASSERT_NE(vectors, nullptr);
+    // Borrowed, not copied: indices sit right after indptr in the file.
+    const auto* indptr_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indptr_data());
+    const auto* indices_bytes =
+        reinterpret_cast<const uint8_t*>(vectors->indices_data());
+    EXPECT_EQ(indices_bytes - indptr_bytes,
+              static_cast<ptrdiff_t>((vectors->num_vectors() + 1) *
+                                     sizeof(nsparse::idx_t)));
+    // The quantizer header survived the mapped read, so the codes are 1 byte
+    // wide rather than being strided as floats.
+    EXPECT_EQ(vectors->get_element_size(), 1);
+
+    std::vector<nsparse::idx_t> q_indptr = {0, 1};
+    std::vector<nsparse::term_t> q_indices = {0};
+    std::vector<float> q_values = {1.0F};
+    std::vector<nsparse::idx_t> labels(1, nsparse::INVALID_IDX);
+    std::vector<float> distances(1, -1.0F);
+    nsparse::SeismicSearchParameters params(5, 1.0F);
+    loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
+                   distances.data(), labels.data(), &params);
     EXPECT_EQ(labels[0], 100);
 }

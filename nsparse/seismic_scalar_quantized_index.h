@@ -17,7 +17,9 @@
 #include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/index.h"
+#include "nsparse/mmap_index.h"
 #include "nsparse/seismic_index.h"
+#include "nsparse/types.h"
 #include "nsparse/utils/scalar_quantizer.h"
 
 namespace nsparse {
@@ -30,10 +32,7 @@ struct SeismicSQSearchParameters : public SeismicSearchParameters {
         : SeismicSearchParameters(cut, heap_factor), vmax(vmax), vmin(vmin) {}
 };
 
-class SeismicScalarQuantizedIndex : public Index, public IndexIO {
-    friend void write_index(Index* index, char* filename);
-    friend Index* read_index(char* filename);
-
+class SeismicScalarQuantizedIndex : public MmapIndex, public IndexIO {
 public:
     static constexpr std::array<char, 4> name = {'S', 'E', 'S', 'Q'};
     explicit SeismicScalarQuantizedIndex(int dim);
@@ -49,9 +48,21 @@ public:
     void add(idx_t n, const idx_t* indptr, const term_t* indices,
              const float* values) override;
     void build() override;
-    const SparseVectors* get_vectors() const override { return vectors_.get(); }
 
     const ScalarQuantizer& get_scalar_quantizer() const { return sq_; }
+
+    // Borrows a serialized index from a file mapping instead of copying it onto
+    // the heap; see SeismicIndex::mmap_index, which this mirrors past the
+    // quantizer header. `pos` is where write_index's payload begins.
+    static SeismicScalarQuantizedIndex* mmap_index(int dimension,
+                                                   const char* index_file,
+                                                   size_t pos);
+
+    // Only the copying residency. A mapped CSR is borrowed at the width it was
+    // written in, which is float, whereas this index searches over codes: the
+    // values have to pass through add() to be quantized.
+    void read_csr(const char* file_path,
+                  Residency residency = Residency::kInMemory) override;
 
 private:
     // interfaces of IndexIO
@@ -60,12 +71,16 @@ private:
     void write_header(IOWriter* io_writer);
     void read_header(IOReader* io_reader);
 
+    // Null `search_parameters` searches with the defaults, as it does for
+    // SeismicIndex and as the base signature's default argument implies. This
+    // index used to reject it, which made that default argument -- and the
+    // bindings' params=None -- unusable here alone.
     auto search(idx_t n, const idx_t* indptr, const term_t* indices,
                 const float* values, int k,
                 SearchParameters* search_parameters = nullptr)
         -> pair_of_score_id_vectors_t override;
-    auto encode(const float* values, size_t nnz,
-                SearchParameters* search_parameters) -> std::vector<uint8_t>;
+    ScalarQuantizer query_quantizer(
+        const SearchParameters* search_parameters) const;
     // `dense` and `visited` are per-thread scratch reused across the queries a
     // thread handles (see search()). `dense` (a dimension-sized quantized-code
     // buffer, element_size bytes per dim) must be all-zero on entry and is
@@ -79,7 +94,6 @@ private:
                       SearchParameters* search_parameters)
         -> pair_of_score_id_vector_t;
     ScalarQuantizer sq_;
-    std::unique_ptr<SparseVectors> vectors_;
     SeismicClusterParameters cluster_parameter_;
 
 protected:

@@ -31,6 +31,13 @@ public:
 
     ScalarQuantizer(QuantizerType qtype, float vmin, float vmax)
         : qtype_(qtype), vmin_(vmin), vmax_(vmax) {
+        // NaN compares false against everything, so `vmax <= vmin` lets a
+        // NaN bound through, and an infinite range scales to zero. Either way
+        // every code and every decoded score comes out NaN, silently, with the
+        // ranking still looking plausible.
+        if (!std::isfinite(vmin) || !std::isfinite(vmax)) {
+            throw std::invalid_argument("vmin and vmax must be finite");
+        }
         if (vmax <= vmin) {
             throw std::invalid_argument("vmax must be greater than vmin");
         }
