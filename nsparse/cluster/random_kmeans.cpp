@@ -26,7 +26,7 @@ namespace nsparse::detail {
 RandomKMeans::RandomKMeans() = default;
 
 static std::vector<std::vector<idx_t>> random_select_initial_centroids(
-    std::vector<idx_t> docs, size_t n_clusters) {
+    std::vector<idx_t> docs, size_t n_clusters, uint32_t seed) {
     size_t n_docs = docs.size();
     if (n_clusters > n_docs) {
         std::cerr << "n_clusters is larger than candidates size\n";
@@ -36,8 +36,7 @@ static std::vector<std::vector<idx_t>> random_select_initial_centroids(
         std::cerr << "n_clusters is smaller or equal to 0\n";
         return {};
     }
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(seed);
     std::vector<std::vector<idx_t>> clusters(n_clusters, std::vector<idx_t>());
 
     for (size_t i = 0; i < n_clusters; i++) {
@@ -65,7 +64,7 @@ inline static size_t boundary_check_n_clusters(size_t n_docs,
 
 std::vector<std::vector<idx_t>> RandomKMeans::train(
     const SparseVectors* vectors, const std::vector<idx_t>& doc_ids,
-    size_t n_clusters) {
+    size_t n_clusters, uint32_t seed) {
     throw_if_any_null(vectors);
     size_t n_docs = doc_ids.size();
     if (n_docs == 0) {
@@ -73,7 +72,7 @@ std::vector<std::vector<idx_t>> RandomKMeans::train(
     }
     n_clusters = boundary_check_n_clusters(n_docs, n_clusters);
 
-    auto clusters = random_select_initial_centroids(doc_ids, n_clusters);
+    auto clusters = random_select_initial_centroids(doc_ids, n_clusters, seed);
     map_docs_to_clusters(vectors, doc_ids, clusters);
     return clusters;
 }

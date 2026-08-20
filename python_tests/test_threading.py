@@ -15,9 +15,11 @@ What can be asserted differs between them:
   count. Any difference means the per-thread scratch buffers in the search loop
   are leaking state between the queries a thread handles.
 
-* Build cannot be asserted that way. RandomKMeans seeds itself from
-  std::random_device with no seed parameter, so two builds of the same corpus
-  differ even single-threaded. Only the recall floor is checkable.
+* Build depends on whether a seed was given. With seed=, each list's seed is
+  derived from its own index, so a build is reproducible and thread-count
+  independent and can be asserted exactly. Without one, every list draws fresh
+  entropy and two builds differ even single-threaded, leaving only a recall
+  floor.
 
 Everything runs through _thread_worker.py in a fresh interpreter, because
 OMP_NUM_THREADS is read when the OpenMP runtime initialises.
@@ -146,12 +148,32 @@ def test_query_thread_count_invariance_mmap(
     np.testing.assert_array_equal(got_d, base_d)
 
 
-@pytest.mark.parametrize("nthreads", THREAD_COUNTS)
-def test_build_thread_count_recall(nthreads, worker_script, tmp_path, corpus):
-    """A parallel build must produce an index of the same quality.
+@pytest.mark.parametrize("nthreads", THREAD_COUNTS[1:])
+def test_seeded_build_thread_count_invariance(nthreads, worker_script, tmp_path):
+    """A seeded build must produce the same index at any thread count.
 
-    Only a recall floor, not equality: RandomKMeans is seeded from
-    std::random_device, so builds are not reproducible at any thread count.
+    Each list's seed is derived from its own index rather than the loop
+    iteration, so the result cannot depend on how OpenMP hands lists to
+    threads. Exact equality here, not a recall floor -- if this ever fails,
+    something in the parallel build depends on scheduling.
+    """
+    spec = "seismic,lambda=25|beta=4|alpha=0.4|seed=42"
+    base_l, base_d = _run(worker_script, 1, spec, tmp_path / "sb1.npz")
+    got_l, got_d = _run(
+        worker_script, nthreads, spec, tmp_path / f"sb{nthreads}.npz"
+    )
+    np.testing.assert_array_equal(got_l, base_l)
+    np.testing.assert_array_equal(got_d, base_d)
+
+
+@pytest.mark.parametrize("nthreads", THREAD_COUNTS)
+def test_unseeded_build_thread_count_recall(
+    nthreads, worker_script, tmp_path, corpus
+):
+    """An unseeded build only has to hold quality, not reproduce itself.
+
+    Without a seed each list draws fresh entropy, so two builds differ even
+    single-threaded and a recall floor is the strongest available assertion.
     """
     from oracle import brute_force_top_k
     from support import make_corpus

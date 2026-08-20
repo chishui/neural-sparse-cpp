@@ -189,6 +189,21 @@ def test_pruning_parameters(corpus, queries, oracle, spec):
     assert recall_at_k(labels, want_labels) > 0.0
 
 
+def test_seeded_build_is_reproducible(corpus, queries):
+    """seed= makes a build reproducible; omitting it keeps it random."""
+    seeded = f"{SPEC}|seed=42"
+    first = search(make_index(seeded, corpus), queries)
+    second = search(make_index(seeded, corpus), queries)
+    np.testing.assert_array_equal(second[1], first[1])
+    np.testing.assert_array_equal(second[0], first[0])
+
+    other = search(make_index(f"{SPEC}|seed=43", corpus), queries)
+    assert not np.array_equal(other[1], first[1]), "seed must change the build"
+
+    unseeded = [search(make_index(SPEC, corpus), queries)[1] for _ in range(2)]
+    assert not np.array_equal(*unseeded), "default must stay nondeterministic"
+
+
 def test_search_before_build(corpus, queries):
     """Searching an unbuilt index yields empty results rather than an error.
 

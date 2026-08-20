@@ -194,8 +194,19 @@ One file per index type, named after the use case being exercised
 (`test_happy_case`, `test_with_id_map`, `test_exact_match`, ...). Accuracy is
 checked against an independent numpy brute-force oracle in
 `python_tests/oracle.py`: exact indexes must match it outright, approximate ones
-must clear a recall floor. Keep floors loose -- `RandomKMeans` seeds itself from
-`std::random_device`, so recall moves between builds.
+must clear a recall floor.
+
+Seismic builds are nondeterministic by default -- every posting list draws fresh
+entropy for its initial centroids -- so keep recall floors loose. Add `seed=` to
+the factory description when a test needs the build to reproduce itself:
+
+```python
+nsparse.index_factory(dim, "seismic,lambda=25|beta=4|alpha=0.4|seed=42")
+```
+
+A seeded build is also independent of `OMP_NUM_THREADS`, because each list's
+seed is derived from its own index rather than from the order OpenMP happens to
+schedule the lists in.
 
 `test_threading.py` runs each case under several `OMP_NUM_THREADS` values in
 subprocesses, which is required because the OpenMP runtime reads that variable
