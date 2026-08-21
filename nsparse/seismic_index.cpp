@@ -269,7 +269,7 @@ auto SeismicIndex::single_query(std::vector<float>& dense,
 
     auto [scores, ids] = holder.top_k_items_descending();
     scores.resize(k, -1.0F);
-    ids.resize(k, INVALID_IDX);
+    ids.resize(k, detail::INVALID_IDX);
     return {scores, ids};
 }
 

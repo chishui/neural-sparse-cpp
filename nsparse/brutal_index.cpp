@@ -91,7 +91,7 @@ auto BrutalIndex::single_query(const std::vector<float>& dense, int k)
         holder.add(score, static_cast<idx_t>(i));
     }
     auto [labels, scores] =
-        holder.top_k_descending_with_scores_and_padding(INVALID_IDX, -1.0F);
+        holder.top_k_descending_with_scores_and_padding(detail::INVALID_IDX, -1.0F);
     return {scores, labels};
 }
 

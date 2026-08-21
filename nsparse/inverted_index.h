@@ -31,6 +31,7 @@ public:
     void add(idx_t n, const idx_t* indptr, const term_t* indices,
              const float* values) override;
     void build() override;
+    size_t num_vectors() const override { return num_vectors_; }
     std::array<char, 4> id() const override { return name; }
     static constexpr std::array<char, 4> name = {'I', 'N', 'V', 'T'};
 
@@ -51,6 +52,10 @@ private:
         -> pair_of_score_id_vector_t;
     std::unique_ptr<ArrayInvertedLists> inverted_lists_;
     std::unique_ptr<SparseVectors> vectors_;
+    // Tracked separately, since build() releases vectors_, and serialised
+    // explicitly, since the posting lists hold no entry for a document whose
+    // terms were all pruned.
+    size_t num_vectors_ = 0;
     // Per-term max posting value, computed at build() time.
     // max_term_scores_[term_id] = max value in that term's posting list.
     std::vector<float> max_term_scores_;

@@ -911,7 +911,7 @@ std::vector<idx_t> search_top(Index* index, term_t term, int k) {
     std::vector<idx_t> indptr = {0, 1};
     std::vector<term_t> indices = {term};
     std::vector<float> values = {1.0F};
-    std::vector<idx_t> labels(k, INVALID_IDX);
+    std::vector<idx_t> labels(k, detail::INVALID_IDX);
     std::vector<float> distances(k, -1.0F);
     index->search(1, indptr.data(), indices.data(), values.data(), k,
                   distances.data(), labels.data());
@@ -1056,6 +1056,57 @@ TEST(SeismicIndexMmapIO, mapped_read_of_an_empty_index) {
 
     ASSERT_NE(loaded, nullptr);
     EXPECT_EQ(loaded->get_vectors(), nullptr);
+}
+
+// ============== seed tests ==============
+
+namespace {
+
+// One corpus, so the seed is the only thing that can differ between builds.
+std::vector<std::map<int, float>> seed_test_docs(int n_docs, int dim) {
+    std::vector<std::map<int, float>> docs;
+    docs.reserve(n_docs);
+    for (int i = 0; i < n_docs; ++i) {
+        docs.push_back({{i % dim, 1.0F + static_cast<float>(i % 13)},
+                        {(i * 7 + 3) % dim, 0.5F + static_cast<float>(i % 5)},
+                        {(i * 11 + 5) % dim, 0.25F + static_cast<float>(i % 3)}});
+    }
+    return docs;
+}
+
+// Search output of a freshly built index, which is what a caller can observe.
+std::pair<std::vector<float>, std::vector<idx_t>> build_and_search(int seed) {
+    constexpr int kDim = 64;
+    constexpr int kDocs = 400;
+    constexpr int kTopK = 10;
+
+    TestableSeismicIndex index(kDim, {.lambda = 25, .beta = 4, .alpha = 0.4F,
+                                      .seed = seed});
+    index.add_docs(seed_test_docs(kDocs, kDim));
+    index.build();
+
+    std::vector<idx_t> query_indptr = {0, 3};
+    std::vector<term_t> query_indices = {1, 17, 33};
+    std::vector<float> query_values = {1.0F, 0.7F, 0.4F};
+    std::vector<float> distances(kTopK);
+    std::vector<idx_t> labels(kTopK);
+    // Through the base: SeismicIndex redeclares search() as protected, which
+    // hides the public Index overload by name.
+    Index& searchable = index;
+    searchable.search(1, query_indptr.data(), query_indices.data(),
+                      query_values.data(), kTopK, distances.data(),
+                      labels.data(), nullptr);
+    return {distances, labels};
+}
+
+}  // namespace
+
+TEST(SeismicIndexSeed, same_seed_builds_an_identical_index) {
+    ASSERT_EQ(build_and_search(42), build_and_search(42));
+}
+
+TEST(SeismicIndexSeed, different_seeds_build_different_indexes) {
+    ASSERT_NE(build_and_search(42), build_and_search(43));
 }
 
 }  // namespace

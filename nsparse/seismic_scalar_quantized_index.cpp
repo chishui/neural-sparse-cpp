@@ -242,7 +242,7 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
             auto& query_distances = distances[query_idx];
             const auto& query_labels = labels[query_idx];
             for (size_t i = 0; i < query_distances.size(); ++i) {
-                if (query_labels[i] != INVALID_IDX) {
+                if (query_labels[i] != detail::INVALID_IDX) {
                     query_distances[i] =
                         sq_.decode_dot_product(query_distances[i], query_sq);
                 }
@@ -352,7 +352,7 @@ auto SeismicScalarQuantizedIndex::single_query(
         dist = sq_.decode_dot_product(dist, query_sq);
     }
     distances.resize(k, -1.0F);
-    labels.resize(k, INVALID_IDX);
+    labels.resize(k, detail::INVALID_IDX);
     return {distances, labels};
 }
 

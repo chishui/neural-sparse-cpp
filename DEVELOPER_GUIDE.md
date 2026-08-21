@@ -172,6 +172,46 @@ To run specific test suites using GoogleTest filters:
 ./build/tests/nsparse_test --gtest_filter="SeismicIndex*"
 ```
 
+### Python integration tests
+
+`python_tests/` holds black-box tests that drive the library the way a user of
+the Python bindings does: only what SWIG exposes, with no access to internals.
+They complement the GoogleTest suite rather than duplicating it -- the C++ tests
+cover the internals SWIG deliberately hides (`MmapCursor`, borrowing
+`map_vectors` views, in-memory `BufferedIOWriter` round-trips).
+
+They need the bindings built and installed:
+
+```bash
+cmake -S . -B build -DNSPARSE_ENABLE_PYTHON=ON
+cmake --build build -j
+pip install "numpy<2.0" pytest
+pip install --no-deps build/nsparse/python
+pytest python_tests -v
+```
+
+One file per index type, named after the use case being exercised
+(`test_happy_case`, `test_with_id_map`, `test_exact_match`, ...). Accuracy is
+checked against an independent numpy brute-force oracle in
+`python_tests/oracle.py`: exact indexes must match it outright, approximate ones
+must clear a recall floor.
+
+Seismic builds are nondeterministic by default -- every posting list draws fresh
+entropy for its initial centroids -- so keep recall floors loose. Add `seed=` to
+the factory description when a test needs the build to reproduce itself:
+
+```python
+nsparse.index_factory(dim, "seismic,lambda=25|beta=4|alpha=0.4|seed=42")
+```
+
+A seeded build is also independent of `OMP_NUM_THREADS`, because each list's
+seed is derived from its own index rather than from the order OpenMP happens to
+schedule the lists in.
+
+`test_threading.py` runs each case under several `OMP_NUM_THREADS` values in
+subprocesses, which is required because the OpenMP runtime reads that variable
+when it initialises.
+
 ## Run Benchmarks
 
 Build with benchmarks enabled and run:
@@ -338,6 +378,8 @@ The `.clang-tidy` configuration enables checks from `bugprone-*`, `modernize-*`,
 Write unit tests for your new functionality using GoogleTest. Tests live in the `tests/` directory with the naming convention `<module>_test.cpp`.
 
 Unit tests are preferred as they are fast and cheap. Try to cover all possible combinations of parameters.
+
+If your change alters what the Python bindings expose or how an index behaves end to end, add a black-box case to `python_tests/` as well. See [Python integration tests](#python-integration-tests).
 
 If your changes could affect backward compatibility, please include relevant tests along with your PR.
 

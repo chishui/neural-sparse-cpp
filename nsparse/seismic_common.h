@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <numeric>
+#include <random>
 #include <vector>
 #include <string>
 
@@ -30,12 +31,19 @@ struct BatchClusteringOption {
     std::string batch_file_output_path;
 };
 
+// Draw fresh entropy at build time, which makes the build unreproducible. Any
+// other value makes it reproducible.
+constexpr int kRandomSeed = -1;
+
 struct SeismicClusterParameters {
     int lambda;
     int beta;
     float alpha;
     int inverted_list_batch_size = 1;
     char* batch_file_output_path = nullptr;
+    // Fix this to make a build reproducible; two builds of the same corpus
+    // differ by default.
+    int seed = kRandomSeed;
 };
 
 namespace detail {
@@ -149,13 +157,25 @@ inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     std::vector<InvertedListClusters> clustered_inverted_lists(
         inverted_lists_size);
 
+    // Resolved once, outside the loop: std::random_device usually opens
+    // /dev/urandom per construction, so drawing per posting list would put a
+    // syscall on every iteration with every thread doing it.
+    // uint32_t, not int: std::random_device yields a full unsigned 32-bit
+    // value, and the per-list offset below must wrap rather than overflow.
+    const uint32_t base_seed =
+        seismic_cluster_params.seed == kRandomSeed
+            ? std::random_device{}()
+            : static_cast<uint32_t>(seismic_cluster_params.seed);
+
 #pragma omp parallel for schedule(dynamic, 64)
     for (int64_t idx = 0; idx < static_cast<int64_t>(inverted_lists_size);
          ++idx) {
         auto& invlist = (*inverted_lists)[idx];
         const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
-        InvertedListClusters inverted_list_clusters(
-            detail::RandomKMeans::train(vectors, doc_ids, beta));
+        // Offset by the list's own index, so which thread picks up which list
+        // cannot change the result.
+        InvertedListClusters inverted_list_clusters(detail::RandomKMeans::train(
+            vectors, doc_ids, beta, base_seed + static_cast<uint32_t>(idx)));
         inverted_list_clusters.summarize(vectors, seismic_cluster_params.alpha);
         clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
         invlist.clear();

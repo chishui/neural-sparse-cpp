@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "nsparse/sparse_vectors.h"
@@ -229,6 +230,7 @@ void InvertedIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
     vectors_->add_vectors(indptr, indptr_size, indices, nnz,
                           reinterpret_cast<const uint8_t*>(values),
                           nnz * kElementSize);
+    num_vectors_ += n;
 }
 
 void InvertedIndex::build() {
@@ -295,7 +297,7 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
     -> pair_of_score_id_vector_t {
     if (size == 0) {
         std::vector<float> scores(k, -1.0F);
-        std::vector<idx_t> ids(k, INVALID_IDX);
+        std::vector<idx_t> ids(k, detail::INVALID_IDX);
         return {scores, ids};
     }
 
@@ -358,11 +360,17 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
 
     auto [result_scores, ids] = heap.top_k_items_descending();
     result_scores.resize(k, -1.0F);
-    ids.resize(k, INVALID_IDX);
+    ids.resize(k, detail::INVALID_IDX);
     return {result_scores, ids};
 }
 
 void InvertedIndex::write_index(IOWriter* io_writer) {
+    // The document count, which the posting lists do not carry: a document
+    // whose terms were all pruned, or that ends the corpus with none, leaves no
+    // entry to recover it from.
+    size_t num_vectors = num_vectors_;
+    io_writer->write(&num_vectors, sizeof(size_t), 1);
+
     // Write inverted lists
     size_t n_terms = inverted_lists_ ? inverted_lists_->size() : 0;
     io_writer->write(&n_terms, sizeof(size_t), 1);
@@ -394,11 +402,22 @@ void InvertedIndex::write_index(IOWriter* io_writer) {
 }
 
 void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
+    io_reader->read(&num_vectors_, sizeof(size_t), 1);
+
     // Read inverted lists
     size_t n_terms = 0;
     io_reader->read(&n_terms, sizeof(size_t), 1);
     size_t element_size = 0;
     io_reader->read(&element_size, sizeof(size_t), 1);
+    // write_index only ever writes kElementSize, so another width means a file
+    // this reader cannot parse -- in particular one written before the document
+    // count above, whose fields all land one slot early. The width also sets
+    // how many code bytes each list holds, so reading on desynchronizes the
+    // stream instead of failing.
+    if (element_size != kElementSize) {
+        throw std::runtime_error(
+            "inverted index file declares an unsupported element width");
+    }
 
     if (n_terms > 0) {
         inverted_lists_ =

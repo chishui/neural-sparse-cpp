@@ -85,9 +85,9 @@ TEST(ExactMatcher, single_query_pads_to_k_when_fewer_docs) {
     EXPECT_EQ(labels[0], 0);
     EXPECT_FLOAT_EQ(scores[0], 7.0F);
     // padded entries
-    EXPECT_EQ(labels[1], nsparse::INVALID_IDX);
+    EXPECT_EQ(labels[1], nsparse::detail::INVALID_IDX);
     EXPECT_FLOAT_EQ(scores[1], -1.0F);
-    EXPECT_EQ(labels[2], nsparse::INVALID_IDX);
+    EXPECT_EQ(labels[2], nsparse::detail::INVALID_IDX);
     EXPECT_FLOAT_EQ(scores[2], -1.0F);
 }
 
@@ -111,7 +111,7 @@ TEST(ExactMatcher, single_query_subset_of_ids) {
     EXPECT_FLOAT_EQ(scores[0], 5.0F);
     EXPECT_EQ(labels[1], 0);
     EXPECT_FLOAT_EQ(scores[1], 1.0F);
-    EXPECT_EQ(labels[2], nsparse::INVALID_IDX);
+    EXPECT_EQ(labels[2], nsparse::detail::INVALID_IDX);
     EXPECT_FLOAT_EQ(scores[2], -1.0F);
 }
 
@@ -183,8 +183,8 @@ TEST(ExactMatcher, search_with_k_greater_than_docs) {
     ASSERT_EQ(result_labels[0].size(), 3);
     EXPECT_EQ(result_labels[0][0], 0);
     EXPECT_FLOAT_EQ(result_distances[0][0], 3.0F);
-    EXPECT_EQ(result_labels[0][1], nsparse::INVALID_IDX);
-    EXPECT_EQ(result_labels[0][2], nsparse::INVALID_IDX);
+    EXPECT_EQ(result_labels[0][1], nsparse::detail::INVALID_IDX);
+    EXPECT_EQ(result_labels[0][2], nsparse::detail::INVALID_IDX);
 }
 
 TEST(ExactMatcher, single_query_with_set_id_selector) {

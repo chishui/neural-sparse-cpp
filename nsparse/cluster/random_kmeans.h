@@ -10,6 +10,7 @@
 #ifndef RANDOM_KMEANS_H
 #define RANDOM_KMEANS_H
 
+#include <cstdint>
 #include <vector>
 #ifdef _MSC_VER
 #include <malloc.h>
@@ -57,9 +58,12 @@ class RandomKMeans {
 public:
     RandomKMeans();
 
+    // `seed` fixes the initial centroid draw. Always a concrete value: a caller
+    // that wants an unreproducible build resolves that once, up front, rather
+    // than per call. See SeismicClusterParameters::seed.
     static std::vector<std::vector<idx_t>> train(
         const SparseVectors* vectors, const std::vector<idx_t>& doc_ids,
-        size_t n_clusters);
+        size_t n_clusters, uint32_t seed);
 };
 
 }  // namespace nsparse::detail

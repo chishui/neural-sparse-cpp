@@ -104,9 +104,11 @@ Index* index_factory(int dimension, const char* description) {
         int lambda = std::stoi(get_param("lambda", "10"));
         int beta = std::stoi(get_param("beta", "5"));
         float alpha = std::stof(get_param("alpha", "0.5"));
+        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
         return new SeismicIndex(dimension, {.lambda = lambda = lambda,
                                             .beta = beta = beta,
-                                            .alpha = alpha = alpha});
+                                            .alpha = alpha = alpha,
+                                            .seed = seed});
     }
 
     if (index_type == "seismic_sq") {
@@ -120,10 +122,12 @@ Index* index_factory(int dimension, const char* description) {
         int lambda = std::stoi(get_param("lambda", "10"));
         int beta = std::stoi(get_param("beta", "5"));
         float alpha = std::stof(get_param("alpha", "0.5"));
+        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
         return new SeismicScalarQuantizedIndex(quantizer_type, vmin, vmax,
                                                {.lambda = lambda = lambda,
                                                 .beta = beta = beta,
-                                                .alpha = alpha = alpha},
+                                                .alpha = alpha = alpha,
+                                                .seed = seed},
                                                dimension);
     }
 

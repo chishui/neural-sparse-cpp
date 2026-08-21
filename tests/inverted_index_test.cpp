@@ -61,15 +61,24 @@ TEST(InvertedIndexConstructor, id_returns_INVT) {
 TEST(InvertedIndexAdd, add_single_vector) {
     InvertedIndex index(5);
     add_docs(index, {{{0, 1.0F}, {1, 0.5F}}});
-    // InvertedIndex doesn't expose get_vectors(), so num_vectors() returns 0.
-    // Just verify no crash and build works after add.
     index.build();
+    EXPECT_EQ(index.num_vectors(), 1);
 }
 
 TEST(InvertedIndexAdd, add_multiple_vectors) {
     InvertedIndex index(5);
     add_docs(index, {{{0, 1.0F}, {1, 0.5F}}, {{2, 0.8F}, {3, 0.6F}}});
     index.build();
+    EXPECT_EQ(index.num_vectors(), 2);
+}
+
+// A document with no terms is still a document, and build() dropping it from
+// the posting lists does not change that.
+TEST(InvertedIndexAdd, add_counts_empty_vectors) {
+    InvertedIndex index(5);
+    add_docs(index, {{{0, 1.0F}}, {}, {{2, 0.8F}}, {}});
+    index.build();
+    EXPECT_EQ(index.num_vectors(), 4);
 }
 
 // ============== search() tests ==============

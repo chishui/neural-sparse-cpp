@@ -43,7 +43,10 @@ public:
     virtual const SparseVectors* get_vectors() const { return nullptr; };
 
     int get_dimension() const { return dimension_; }
-    size_t num_vectors() const {
+    // Virtual because an index need not retain its vectors: InvertedIndex
+    // releases them once the posting lists are built, so it tracks the count
+    // itself rather than deriving it from get_vectors().
+    virtual size_t num_vectors() const {
         const auto* vectors = get_vectors();
         return vectors == nullptr ? 0 : vectors->num_vectors();
     }
