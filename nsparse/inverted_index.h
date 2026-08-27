@@ -11,6 +11,7 @@
 #define INVERTED_INDEX_H
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -35,12 +36,14 @@ public:
     size_t num_vectors() const override { return num_vectors_; }
     std::array<char, 4> id() const override { return name; }
     static constexpr std::array<char, 4> name = {'I', 'N', 'V', 'T'};
+    // Bump whenever write_index's payload layout changes.
+    static constexpr uint32_t kFormatVersion = 1;
 
     // Reads what write_index wrote, with the posting lists borrowing from a
     // mapping of `index_file` instead of being copied onto the heap. `pos` is
     // where the payload begins, past the header read_header consumed.
-    static InvertedIndex* mmap_index(int dimension, const char* index_file,
-                                     size_t pos);
+    static InvertedIndex* mmap_index(const IndexHeader& header,
+                                     const char* index_file, size_t pos);
 
 protected:
     auto search(idx_t n, const idx_t* indptr, const term_t* indices,
@@ -50,8 +53,12 @@ protected:
 
 private:
     // IndexIO overrides
+    [[nodiscard]] uint32_t format_version() const override {
+        return kFormatVersion;
+    }
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader, int io_flags) override;
+    void read_index(IOReader* io_reader, const IndexHeader& header,
+                    int io_flags) override;
 
     // `id_selector` may be null; when set, only member docs are returned.
     auto single_query(const term_t* indices, const float* values, int size,

@@ -10,13 +10,14 @@
 #ifndef SEISMIC_INDEX_H
 #define SEISMIC_INDEX_H
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
-#include "nsparse/mmap_index.h"
 #include "nsparse/io/io.h"
+#include "nsparse/mmap_index.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
@@ -34,6 +35,8 @@ struct SeismicSearchParameters : public SearchParameters {
 class SeismicIndex : public MmapIndex, public IndexIO {
 public:
     static constexpr std::array<char, 4> name = {'S', 'E', 'I', 'S'};
+    // Bump whenever write_index's payload layout changes.
+    static constexpr uint32_t kFormatVersion = 1;
 
     explicit SeismicIndex(int dim);
     SeismicIndex(int dim, SeismicClusterParameters parameter);
@@ -47,15 +50,21 @@ public:
 
     void add(idx_t n, const idx_t* indptr, const term_t* indices,
              const float* values) override;
-    
-    static SeismicIndex* mmap_index(int dimension, const char * index_file, size_t pos);
+
+    static SeismicIndex* mmap_index(const IndexHeader& header,
+                                    const char* index_file, size_t pos);
+
 protected:
     std::vector<InvertedListClusters> clustered_inverted_lists;
 
 private:
     // override of IndexIO
+    [[nodiscard]] uint32_t format_version() const override {
+        return kFormatVersion;
+    }
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader, int io_flags = 0) override;
+    void read_index(IOReader* io_reader, const IndexHeader& header,
+                    int io_flags = 0) override;
 
     auto search(idx_t n, const idx_t* indptr, const term_t* indices,
                 const float* values, int k,

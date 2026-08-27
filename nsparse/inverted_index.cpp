@@ -427,7 +427,8 @@ void InvertedIndex::write_index(IOWriter* io_writer) {
     io_align::write_padded(io_writer, max_term_scores_.data(), scores_size);
 }
 
-void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
+void InvertedIndex::read_index(IOReader* io_reader, const IndexHeader& header,
+                               int io_flags) {
     size_t num_vectors = 0;
     io_reader->read(&num_vectors, sizeof(size_t), 1);
 
@@ -450,10 +451,10 @@ void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
     }
 }
 
-InvertedIndex* InvertedIndex::mmap_index(int dimension, const char* index_file,
-                                         size_t pos) {
+InvertedIndex* InvertedIndex::mmap_index(const IndexHeader& header,
+                                         const char* index_file, size_t pos) {
     throw_if_null(index_file, "index_file must not be null");
-    auto index = std::make_unique<InvertedIndex>(dimension);
+    auto index = std::make_unique<InvertedIndex>(header.dimension);
 
     MmapFile mmap_file(std::string{index_file});
     // `pos` is where write_index's payload begins, past the header read_header

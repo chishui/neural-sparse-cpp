@@ -383,6 +383,28 @@ If your change alters what the Python bindings expose or how an index behaves en
 
 If your changes could affect backward compatibility, please include relevant tests along with your PR.
 
+### Index file format
+
+Every serialized index starts with a fixed header (`nsparse::IndexHeader` in `nsparse/io/io.h`). It is written and parsed centrally, by `write_header`/`read_header` in `nsparse/io/index_io.cpp` — an index type never reads its own header, it receives the already-parsed one:
+
+| Field | Type | Notes |
+|---|---|---|
+| id | `uint32` | fourcc of the index type, e.g. `SEIS` |
+| version | `uint32` | layout revision of the payload that follows |
+| dimension | `int32` | |
+
+The payload follows immediately, and its layout is the index type's own business. A type parses it in `read_index` (copying), `mmap_index` (borrowed from a file mapping), or both — `DiskSeismicIndex` is mmap-only and its `read_index` just throws, while `IDMapIndex` has no `mmap_index` at all and instead threads `io_flags` down to its delegate.
+
+Versions are numbered **per index type**, not per file: `IndexIO::format_version()` returns the type's own `kFormatVersion`, so revising one type's payload leaves the others' numbering alone. An `IDMapIndex` writes its own header for the id map and then a second, complete header for the delegate it wraps, each with its own version.
+
+The same central code rejects a version outside `1..format_version()` before dispatching to either parse path — a file from a newer build fails with a clear error instead of consuming whatever its fields happen to align with.
+
+To change a payload layout:
+
+1. Bump that type's `kFormatVersion`.
+2. Branch on `header.version` wherever that type actually parses its payload — its `read_index` and/or its `mmap_index` — keeping the older branch so existing files still load.
+3. Add a round-trip test for the new version and a test that reads the old layout.
+
 ### Outdated or irrelevant code
 
 Do not submit code that is not used or needed, even if it's commented. We rely on GitHub as a version control system; code can be restored if needed.

@@ -49,12 +49,46 @@ public:
     virtual void deserialize(IOReader* reader) = 0;
 };
 
+// The fixed-size header written ahead of every index payload, a nested
+// delegate's included: fourcc id, format version, dimension. The version comes
+// second so that a later change to the rest of the header stays reachable -- id
+// and version parse the same way at every version.
+//
+// Passed around whole rather than as a loose version: the two are adjacent
+// integers at every call site that needs them, and a struct is not silently
+// swappable with an io_flags or a dimension.
+struct IndexHeader {
+    uint32_t id = 0;
+    // Numbered per index type, not per file: each type versions its own
+    // payload, so changing one leaves the others' numbering untouched and a
+    // nested delegate carries its own. See IndexIO::format_version.
+    uint32_t version = 0;
+    int dimension = 0;
+};
+
+// Where a payload starts, relative to the header before it. The fields are
+// written one at a time with no padding between them.
+constexpr size_t kIndexHeaderSize =
+    sizeof(uint32_t) + sizeof(uint32_t) + sizeof(int);
 
 class IndexIO {
 public:
     virtual ~IndexIO() = default;
+
+    // Layout revision this index type writes. Recorded in the header above and
+    // handed back to read_index; bumped only when *this* type's payload
+    // changes.
+    //
+    // Pure rather than defaulted: an inherited version would let a payload
+    // change ship without one, which is the failure the header exists to catch.
+    [[nodiscard]] virtual uint32_t format_version() const = 0;
+
     virtual void write_index(IOWriter* io_writer) {};
-    virtual void read_index(IOReader* io_reader, int io_flags = 0) {};
+
+    // `header` is what the file declared, with its version already checked
+    // against format_version(): it is in 1..format_version(), never newer.
+    virtual void read_index(IOReader* io_reader, const IndexHeader& header,
+                            int io_flags = 0){};
 };
 
 constexpr uint32_t fourcc(const std::array<char, 4>& id) {

@@ -9,9 +9,11 @@
 
 #include "nsparse/io/index_io.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 #include "nsparse/brutal_index.h"
 #include "nsparse/disk_seismic_index.h"
@@ -24,6 +26,8 @@
 namespace nsparse {
 
 namespace {
+constexpr uint32_t kBitsPerByte = 8;
+
 constexpr uint32_t BRUT = fourcc(BrutalIndex::name);
 constexpr uint32_t SEIS = fourcc(SeismicIndex::name);
 constexpr uint32_t SESQ = fourcc(SeismicScalarQuantizedIndex::name);
@@ -71,55 +75,90 @@ private:
     T* stream_;
 };
 
-// Reads `id`'s payload by borrowing it from the file rather than copying it, or
-// returns nullptr for an index type without a mapped reader. `pos` is where the
-// payload begins, past the header read_header consumed.
-Index* mmap_index_payload(uint32_t id, int dimension, const char* file_name,
+// Reads `header`'s payload by borrowing it from the file rather than copying
+// it, or returns nullptr for an index type without a mapped reader. `pos` is
+// where the payload begins, past the header read_header consumed.
+Index* mmap_index_payload(const IndexHeader& header, const char* file_name,
                           size_t pos) {
-    switch (id) {
+    switch (header.id) {
         case SEIS:
-            return SeismicIndex::mmap_index(dimension, file_name, pos);
+            return SeismicIndex::mmap_index(header, file_name, pos);
         case SESQ:
-            return SeismicScalarQuantizedIndex::mmap_index(dimension, file_name,
+            return SeismicScalarQuantizedIndex::mmap_index(header, file_name,
                                                            pos);
         case INVT:
-            return InvertedIndex::mmap_index(dimension, file_name, pos);
+            return InvertedIndex::mmap_index(header, file_name, pos);
         case DSEI:
-            return DiskSeismicIndex::mmap_index(dimension, file_name, pos);
+            return DiskSeismicIndex::mmap_index(header, file_name, pos);
         default:
             return nullptr;
     }
 }
 
-void write_header(Index* index, IOWriter* io_writer) {
+// The id as it reads in the file, for error messages: a fourcc is four
+// printable characters, and its numeric value is not what a reader would
+// recognise.
+std::string id_to_string(uint32_t id_val) {
+    std::string chars(4, '\0');
+    for (size_t i = 0; i < chars.size(); ++i) {
+        chars[i] = static_cast<char>((id_val >> (kBitsPerByte * i)) & 0xFFU);
+    }
+    return chars;
+}
+
+void write_header(const IndexHeader& header, IOWriter* io_writer) {
     // write index type
-    auto id_val = fourcc(index->id());
+    uint32_t id_val = header.id;
     io_writer->write(&id_val, sizeof(uint32_t), 1);
+    // write payload layout version
+    uint32_t version = header.version;
+    io_writer->write(&version, sizeof(uint32_t), 1);
     // write dimension
-    auto dimension = index->get_dimension();
+    int dimension = header.dimension;
     io_writer->write(&dimension, sizeof(int), 1);
 }
 
-Index* read_header(IOReader* io_reader) {
-    uint32_t id_val = 0;
-    io_reader->read(&id_val, sizeof(uint32_t), 1);
-    int dimension = 0;
-    io_reader->read(&dimension, sizeof(int), 1);
-    switch (id_val) {
+IndexHeader read_header(IOReader* io_reader) {
+    IndexHeader header;
+    io_reader->read(&header.id, sizeof(uint32_t), 1);
+    io_reader->read(&header.version, sizeof(uint32_t), 1);
+    io_reader->read(&header.dimension, sizeof(int), 1);
+    return header;
+}
+
+// Constructs the index the id names, still empty: the payload is what
+// read_index/mmap_index fill in.
+Index* make_index(const IndexHeader& header) {
+    switch (header.id) {
         case BRUT:
-            return new BrutalIndex(dimension);
+            return new BrutalIndex(header.dimension);
         case SEIS:
-            return new SeismicIndex(dimension);
+            return new SeismicIndex(header.dimension);
         case SESQ:
-            return new SeismicScalarQuantizedIndex(dimension);
+            return new SeismicScalarQuantizedIndex(header.dimension);
         case DSEI:
-            return new DiskSeismicIndex(dimension);
+            return new DiskSeismicIndex(header.dimension);
         case IDMP:
             return new IDMapIndex();
         case INVT:
-            return new InvertedIndex(dimension);
+            return new InvertedIndex(header.dimension);
         default:
             throw std::runtime_error("Unknown index type");
+    }
+}
+
+// A version outside 1..supported is one this build cannot lay out: either it
+// postdates this binary, or no writer ever produced it. Reading the payload
+// anyway would consume whatever the fields happen to align with, so the file is
+// rejected here instead.
+void throw_if_version_unsupported(const IndexHeader& header,
+                                  uint32_t supported) {
+    if (header.version == 0 || header.version > supported) {
+        throw std::runtime_error("Unsupported " + id_to_string(header.id) +
+                                 " index format version " +
+                                 std::to_string(header.version) +
+                                 "; this build reads versions 1 through " +
+                                 std::to_string(supported));
     }
 }
 }  // namespace
@@ -132,7 +171,10 @@ void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
         throw std::runtime_error("Index does not support serialization");
     }
     // write header
-    write_header(index, io_writer);
+    write_header({.id = fourcc(index->id()),
+                  .version = index_io->format_version(),
+                  .dimension = index->get_dimension()},
+                 io_writer);
     // write index customized payload
     index_io->write_index(io_writer);
     closer.close();
@@ -140,12 +182,16 @@ void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
 
 Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
     StreamCloser closer(io_reader, keep_open);
+    const IndexHeader header = read_header(io_reader);
     // Held so it does not leak if anything below throws, close() included.
-    std::unique_ptr<Index> index(read_header(io_reader));
+    std::unique_ptr<Index> index(make_index(header));
     auto* index_io = dynamic_cast<IndexIO*>(index.get());
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
     }
+    // Ahead of either read below, so a payload this build cannot lay out is
+    // never parsed.
+    throw_if_version_unsupported(header, index_io->format_version());
 
     // handle mmap
     if ((io_flags & IndexIoFlag::kUseMmap) == IndexIoFlag::kUseMmap) {
@@ -155,8 +201,7 @@ Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
             // serialize() padded against. An index type without a mapped reader
             // returns null and falls through to the copying read below.
             std::unique_ptr<Index> mapped(mmap_index_payload(
-                fourcc(index->id()), index->get_dimension(),
-                file_io_reader->file_name().c_str(), io_reader->pos()));
+                header, file_io_reader->file_name().c_str(), io_reader->pos()));
             if (mapped != nullptr) {
                 index.reset();
                 closer.close();
@@ -165,7 +210,7 @@ Index* read_index(IOReader* io_reader, bool keep_open, int io_flags) {
         }
     }
 
-    index_io->read_index(io_reader, io_flags);
+    index_io->read_index(io_reader, header, io_flags);
     closer.close();
     return index.release();
 }

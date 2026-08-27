@@ -11,6 +11,7 @@
 #define DISK_SEISMIC_INDEX_H
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -52,6 +53,8 @@ struct DiskSeismicSearchParameters : public SeismicSearchParameters {
 class DiskSeismicIndex : public MmapIndex, public IndexIO {
 public:
     static constexpr std::array<char, 4> name = {'D', 'S', 'E', 'I'};
+    // Bump whenever write_index's payload layout changes.
+    static constexpr uint32_t kFormatVersion = 1;
 
     explicit DiskSeismicIndex(int dim);
     DiskSeismicIndex(int dim, SeismicClusterParameters parameter);
@@ -70,16 +73,20 @@ public:
 
     // Borrows a serialized index from a file mapping. `pos` is where the
     // payload begins.
-    static DiskSeismicIndex* mmap_index(int dimension, const char* index_file,
-                                        size_t pos);
+    static DiskSeismicIndex* mmap_index(const IndexHeader& header,
+                                        const char* index_file, size_t pos);
 
 protected:
     std::vector<InvertedListClusters> clustered_inverted_lists;
 
 private:
+    [[nodiscard]] uint32_t format_version() const override {
+        return kFormatVersion;
+    }
     void write_index(IOWriter* io_writer) override;
     // Unsupported: the inline forward index is mmap-only. Throws.
-    void read_index(IOReader* io_reader, int io_flags = 0) override;
+    void read_index(IOReader* io_reader, const IndexHeader& header,
+                    int io_flags = 0) override;
 
     auto search(idx_t n, const idx_t* indptr, const term_t* indices,
                 const float* values, int k,

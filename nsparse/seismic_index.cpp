@@ -284,7 +284,8 @@ void SeismicIndex::write_index(IOWriter* io_writer) {
     inv_list_writer.serialize(io_writer);
 }
 
-void SeismicIndex::read_index(IOReader* io_reader, int io_flags) {
+void SeismicIndex::read_index(IOReader* io_reader, const IndexHeader& header,
+                              int io_flags) {
     // read vectors
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
@@ -297,10 +298,10 @@ void SeismicIndex::read_index(IOReader* io_reader, int io_flags) {
     clustered_inverted_lists = std::move(inv_list_writer.release());
 }
 
-SeismicIndex* SeismicIndex::mmap_index(int dimension, const char* index_file,
-                                       size_t pos) {
+SeismicIndex* SeismicIndex::mmap_index(const IndexHeader& header,
+                                       const char* index_file, size_t pos) {
     throw_if_null(index_file, "index_file must not be null");
-    auto index = std::make_unique<SeismicIndex>(dimension);
+    auto index = std::make_unique<SeismicIndex>(header.dimension);
 
     MmapFile mmap_file(std::string{index_file});
     // `pos` is where write_index's payload begins, past the header read_header

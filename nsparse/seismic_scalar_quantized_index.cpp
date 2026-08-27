@@ -357,7 +357,7 @@ auto SeismicScalarQuantizedIndex::single_query(
 }
 
 void SeismicScalarQuantizedIndex::write_index(IOWriter* io_writer) {
-    write_header(io_writer);
+    write_quantizer_header(io_writer);
     // write vectors
     if (vectors_ == nullptr) {
         empty_sparse_vectors.serialize(io_writer);
@@ -368,8 +368,10 @@ void SeismicScalarQuantizedIndex::write_index(IOWriter* io_writer) {
     inv_list_writer.serialize(io_writer);
 }
 
-void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader, int io_flags) {
-    read_header(io_reader);
+void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader,
+                                             const IndexHeader& header,
+                                             int io_flags) {
+    read_quantizer_header(io_reader);
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
     throw_if_element_size_mismatch(tmp_vectors, sq_);
@@ -382,9 +384,10 @@ void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader, int io_flags) 
 }
 
 SeismicScalarQuantizedIndex* SeismicScalarQuantizedIndex::mmap_index(
-    int dimension, const char* index_file, size_t pos) {
+    const IndexHeader& header, const char* index_file, size_t pos) {
     throw_if_null(index_file, "index_file must not be null");
-    auto index = std::make_unique<SeismicScalarQuantizedIndex>(dimension);
+    auto index =
+        std::make_unique<SeismicScalarQuantizedIndex>(header.dimension);
 
     MmapFile mmap_file(std::string{index_file});
     // `pos` is where write_index's payload begins, past the header read_header
@@ -393,7 +396,7 @@ SeismicScalarQuantizedIndex* SeismicScalarQuantizedIndex::mmap_index(
     MmapCursor cursor(mmap_file.data(), mmap_file.size());
     cursor.skip(pos);
 
-    // Same order write_index wrote them, starting with what write_header wrote.
+    // Same order write_index wrote them, starting with the quantizer header.
     const auto sq_type = cursor.read_scalar<QuantizerType>();
     const auto vmin = cursor.read_scalar<float>();
     const auto vmax = cursor.read_scalar<float>();
@@ -418,7 +421,7 @@ SeismicScalarQuantizedIndex* SeismicScalarQuantizedIndex::mmap_index(
     return index.release();
 }
 
-void SeismicScalarQuantizedIndex::write_header(IOWriter* io_writer) {
+void SeismicScalarQuantizedIndex::write_quantizer_header(IOWriter* io_writer) {
     auto sq_type = sq_.get_quantizer_type();
     io_writer->write(&sq_type, sizeof(QuantizerType), 1);
     auto vmin = sq_.get_min();
@@ -427,7 +430,7 @@ void SeismicScalarQuantizedIndex::write_header(IOWriter* io_writer) {
     io_writer->write(&vmax, sizeof(float), 1);
 }
 
-void SeismicScalarQuantizedIndex::read_header(IOReader* io_reader) {
+void SeismicScalarQuantizedIndex::read_quantizer_header(IOReader* io_reader) {
     QuantizerType sq_type = QuantizerType::QT_8bit;
     float vmin = 0.0F;
     float vmax = 1.0F;
