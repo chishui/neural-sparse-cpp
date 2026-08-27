@@ -312,7 +312,9 @@ void DiskSeismicIndex::write_index(IOWriter* io_writer) {
     forward.serialize(io_writer);
 }
 
-void DiskSeismicIndex::read_index(IOReader* /*io_reader*/, int /*io_flags*/) {
+void DiskSeismicIndex::read_index(IOReader* /*io_reader*/,
+                                  const IndexHeader& /*header*/,
+                                  int /*io_flags*/) {
     // The inline forward index is borrowed from a mapping, never copied onto
     // the heap, so this index has no copying read path.
     throw std::runtime_error(
@@ -320,11 +322,11 @@ void DiskSeismicIndex::read_index(IOReader* /*io_reader*/, int /*io_flags*/) {
         "IndexIoFlag::kUseMmap)");
 }
 
-DiskSeismicIndex* DiskSeismicIndex::mmap_index(int dimension,
+DiskSeismicIndex* DiskSeismicIndex::mmap_index(const IndexHeader& header,
                                                const char* index_file,
                                                size_t pos) {
     throw_if_null(index_file, "index_file must not be null");
-    auto index = std::make_unique<DiskSeismicIndex>(dimension);
+    auto index = std::make_unique<DiskSeismicIndex>(header.dimension);
 
     MmapFile mmap_file(std::string{index_file});
     MmapCursor cursor(mmap_file.data(), mmap_file.size());

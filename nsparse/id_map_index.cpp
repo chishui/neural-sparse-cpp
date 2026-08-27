@@ -89,7 +89,8 @@ void IDMapIndex::write_index(IOWriter* io_writer) {
     nsparse::detail::write_index(delegate_.get(), io_writer, true);
 }
 
-void IDMapIndex::read_index(IOReader* io_reader, int io_flags) {
+void IDMapIndex::read_index(IOReader* io_reader, const IndexHeader& header,
+                            int io_flags) {
     // Read internal_to_external_ vector
     size_t map_size = 0;
     io_reader->read(&map_size, sizeof(size_t), 1);

@@ -776,11 +776,9 @@ pair_of_score_id_vector_t search_one(Index* index,
     return {distances, labels};
 }
 
-// The stored element width, counting past the fourcc and dimension read_index
-// consumes, and past the document count and term count write_index puts ahead
-// of it.
-constexpr size_t kElementSizeOffset =
-    sizeof(uint32_t) + sizeof(int) + (2 * sizeof(size_t));
+// The stored element width, counting past the header read_index consumes, and
+// past the document count and term count write_index puts ahead of it.
+constexpr size_t kElementSizeOffset = kIndexHeaderSize + (2 * sizeof(size_t));
 
 template <class T>
 T read_field(const std::string& path, size_t offset) {

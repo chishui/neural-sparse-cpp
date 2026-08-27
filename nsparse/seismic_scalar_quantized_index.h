@@ -11,12 +11,14 @@
 #define SEISMIC_SCALAR_QUANTIZED_INDEX_H
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/index.h"
+#include "nsparse/io/io.h"
 #include "nsparse/mmap_index.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
@@ -35,6 +37,9 @@ struct SeismicSQSearchParameters : public SeismicSearchParameters {
 class SeismicScalarQuantizedIndex : public MmapIndex, public IndexIO {
 public:
     static constexpr std::array<char, 4> name = {'S', 'E', 'S', 'Q'};
+    // Bump whenever write_index's payload layout changes.
+    static constexpr uint32_t kFormatVersion = 1;
+
     explicit SeismicScalarQuantizedIndex(int dim);
     SeismicScalarQuantizedIndex(QuantizerType quantizer_type, float vmin,
                                 float vmax, SeismicClusterParameters parameter,
@@ -54,7 +59,7 @@ public:
     // Borrows a serialized index from a file mapping instead of copying it onto
     // the heap; see SeismicIndex::mmap_index, which this mirrors past the
     // quantizer header. `pos` is where write_index's payload begins.
-    static SeismicScalarQuantizedIndex* mmap_index(int dimension,
+    static SeismicScalarQuantizedIndex* mmap_index(const IndexHeader& header,
                                                    const char* index_file,
                                                    size_t pos);
 
@@ -66,10 +71,16 @@ public:
 
 private:
     // interfaces of IndexIO
+    [[nodiscard]] uint32_t format_version() const override {
+        return kFormatVersion;
+    }
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader, int io_flags = 0) override;
-    void write_header(IOWriter* io_writer);
-    void read_header(IOReader* io_reader);
+    void read_index(IOReader* io_reader, const IndexHeader& header,
+                    int io_flags = 0) override;
+    // The quantizer parameters that open this index's payload -- distinct from
+    // the IndexHeader the file itself starts with.
+    void write_quantizer_header(IOWriter* io_writer);
+    void read_quantizer_header(IOReader* io_reader);
 
     // Null `search_parameters` searches with the defaults, as it does for
     // SeismicIndex and as the base signature's default argument implies. This

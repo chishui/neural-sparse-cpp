@@ -11,6 +11,7 @@
 #define ID_MAP_INDEX_H
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <ranges>
 #include <vector>
@@ -79,6 +80,9 @@ class IDMapIndex : public Index, public IndexIO {
 public:
     IDMapIndex() = default;
     static constexpr std::array<char, 4> name = {'I', 'D', 'M', 'P'};
+    // Covers the id map only; the delegate that follows carries its own header
+    // and versions its payload independently.
+    static constexpr uint32_t kFormatVersion = 1;
     // Takes ownership of the delegate index; it is freed when this IDMapIndex
     // is destroyed.
     explicit IDMapIndex(Index*);
@@ -97,8 +101,12 @@ public:
 
     void add_with_ids(idx_t n, const idx_t* indptr, const term_t* indices,
                       const float* values, const idx_t* ids) override;
+    [[nodiscard]] uint32_t format_version() const override {
+        return kFormatVersion;
+    }
     void write_index(IOWriter* io_writer) override;
-    void read_index(IOReader* io_reader, int io_flags = 0) override;
+    void read_index(IOReader* io_reader, const IndexHeader& header,
+                    int io_flags = 0) override;
 
 private:
     // Owns the wrapped delegate index. Using unique_ptr ensures the delegate is

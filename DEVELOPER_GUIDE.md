@@ -383,6 +383,28 @@ If your change alters what the Python bindings expose or how an index behaves en
 
 If your changes could affect backward compatibility, please include relevant tests along with your PR.
 
+### Index file format
+
+Every serialized index starts with a fixed header (`nsparse::IndexHeader` in `nsparse/io/io.h`), written by `write_index` and consumed by `read_index`:
+
+| Field | Type | Notes |
+|---|---|---|
+| id | `uint32` | fourcc of the index type, e.g. `SEIS` |
+| version | `uint32` | layout revision of the payload that follows |
+| dimension | `int32` | |
+
+The payload follows immediately, and its layout is the index type's own business.
+
+Versions are numbered **per index type**, not per file: `IndexIO::format_version()` returns the type's own `kFormatVersion`, so revising one type's payload leaves the others' numbering alone. An `IDMapIndex` writes its own header for the id map and then a second, complete header for the delegate it wraps, each with its own version.
+
+`read_index` rejects a version outside `1..format_version()` before parsing any payload — a file from a newer build fails with a clear error instead of consuming whatever its fields happen to align with.
+
+To change a payload layout:
+
+1. Bump that type's `kFormatVersion`.
+2. Branch on `header.version` in the type's `read_index` **and** its `mmap_index`, keeping the older branch so existing files still load.
+3. Add a round-trip test for the new version and a test that reads the old layout.
+
 ### Outdated or irrelevant code
 
 Do not submit code that is not used or needed, even if it's commented. We rely on GitHub as a version control system; code can be restored if needed.

@@ -15,11 +15,13 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "nsparse/brutal_index.h"
+#include "nsparse/disk_seismic_index.h"
 #include "nsparse/id_map_index.h"
 #include "nsparse/index.h"
 #include "nsparse/inverted_index.h"
@@ -83,10 +85,12 @@ private:
 class MockIndex : public nsparse::Index, public nsparse::IndexIO {
 public:
     static constexpr std::array<char, 4> name = {'M', 'O', 'C', 'K'};
+    static constexpr uint32_t kFormatVersion = 1;
 
     explicit MockIndex(int dim = 0) : Index(dim) {}
 
     std::array<char, 4> id() const override { return name; }
+    uint32_t format_version() const override { return kFormatVersion; }
 
     void add(nsparse::idx_t /*n*/, const nsparse::idx_t* /*indptr*/,
              const nsparse::term_t* /*indices*/,
@@ -104,7 +108,9 @@ public:
         io_writer->write(test_string_.data(), sizeof(char), size);
     }
 
-    void read_index(nsparse::IOReader* io_reader, int /*io_flags*/) override {
+    void read_index(nsparse::IOReader* io_reader,
+                    const nsparse::IndexHeader& /*header*/,
+                    int /*io_flags*/) override {
         io_reader->read(&test_data_, sizeof(int), 1);
         size_t size = 0;
         io_reader->read(&size, sizeof(size_t), 1);
@@ -143,10 +149,19 @@ TEST(IndexIO, WriteIndexBasic) {
     std::memcpy(&written_fourcc, data.data(), sizeof(uint32_t));
     ASSERT_EQ(written_fourcc, nsparse::fourcc(MockIndex::name));
 
-    // Verify dimension is written after fourcc
+    // Verify the format version is written after the fourcc
+    uint32_t written_version = 0;
+    std::memcpy(&written_version, data.data() + sizeof(uint32_t),
+                sizeof(uint32_t));
+    ASSERT_EQ(written_version, MockIndex::kFormatVersion);
+
+    // Verify dimension is written after the version
     int written_dim = 0;
-    std::memcpy(&written_dim, data.data() + sizeof(uint32_t), sizeof(int));
+    std::memcpy(&written_dim, data.data() + 2 * sizeof(uint32_t), sizeof(int));
     ASSERT_EQ(written_dim, 128);
+
+    // The payload starts right after those three fields.
+    ASSERT_EQ(nsparse::kIndexHeaderSize, 2 * sizeof(uint32_t) + sizeof(int));
 }
 
 // Test write_index throws for non-IndexIO index
@@ -172,11 +187,13 @@ TEST(IndexIO, WriteIndexThrowsForNonIndexIO) {
 // Test read_index throws for unknown index type
 TEST(IndexIO, ReadIndexThrowsForUnknownType) {
     // Create a buffer with an unknown fourcc
-    std::vector<uint8_t> buffer(sizeof(uint32_t) + sizeof(int));
+    std::vector<uint8_t> buffer(nsparse::kIndexHeaderSize);
     uint32_t unknown_fourcc = 0xDEADBEEF;
+    uint32_t version = 1;
     int dimension = 64;
     std::memcpy(buffer.data(), &unknown_fourcc, sizeof(uint32_t));
-    std::memcpy(buffer.data() + sizeof(uint32_t), &dimension, sizeof(int));
+    std::memcpy(buffer.data() + sizeof(uint32_t), &version, sizeof(uint32_t));
+    std::memcpy(buffer.data() + 2 * sizeof(uint32_t), &dimension, sizeof(int));
 
     nsparse::BufferedIOReader reader(buffer);
     ASSERT_THROW(nsparse::read_index(&reader), std::runtime_error);
@@ -494,10 +511,11 @@ TEST(IndexIO, RoundtripInvertedIndexCountsATrailingEmptyDocument) {
     EXPECT_EQ(loaded->num_vectors(), 2);
 }
 
-// The INVT payload has no version to check, so a file written before it carried
-// the document count reads with every field one slot early. The element width
-// is what gives that away: write_index only ever writes U32, and the value
-// landing there instead is the first posting list's size.
+// Defence behind the header version, for a file whose version does not admit it
+// is stale: dropping the document count leaves every later field one slot
+// early. The element width is what gives that away -- write_index only ever
+// writes U32, and the value landing there instead is the first posting list's
+// size.
 TEST(IndexIO, ReadIndexRejectsAnInvertedIndexFileWithoutTheDocumentCount) {
     nsparse::InvertedIndex original(128);
 
@@ -510,12 +528,11 @@ TEST(IndexIO, ReadIndexRejectsAnInvertedIndexFileWithoutTheDocumentCount) {
     nsparse::BufferedIOWriter writer;
     nsparse::write_index(&original, &writer);
 
-    // The header is a fourcc and a dimension; the count is the payload's first
-    // field, so dropping it is exactly the old layout.
+    // The count is the payload's first field, so dropping it is exactly the old
+    // layout.
     std::vector<uint8_t> stale = writer.data();
-    const size_t header = sizeof(uint32_t) + sizeof(int);
-    stale.erase(stale.begin() + header,
-                stale.begin() + header + sizeof(size_t));
+    stale.erase(stale.begin() + nsparse::kIndexHeaderSize,
+                stale.begin() + nsparse::kIndexHeaderSize + sizeof(size_t));
 
     nsparse::BufferedIOReader reader(stale);
     EXPECT_THROW(nsparse::read_index(&reader), std::runtime_error);
@@ -703,4 +720,239 @@ TEST(IndexIO, UseMmapFlagReachesTheIDMapQuantizedDelegate) {
     loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
                    distances.data(), labels.data(), &params);
     EXPECT_EQ(labels[0], 100);
+}
+
+namespace {
+
+// Header fields are written one at a time with no padding, so the version sits
+// one uint32_t past the start of the header it belongs to.
+constexpr size_t version_offset(size_t header_offset) {
+    return header_offset + sizeof(uint32_t);
+}
+
+uint32_t read_u32(const std::vector<uint8_t>& data, size_t offset) {
+    uint32_t value = 0;
+    std::memcpy(&value, data.data() + offset, sizeof(uint32_t));
+    return value;
+}
+
+void patch_u32(std::vector<uint8_t>& data, size_t offset, uint32_t value) {
+    ASSERT_LE(offset + sizeof(uint32_t), data.size());
+    std::memcpy(data.data() + offset, &value, sizeof(uint32_t));
+}
+
+void patch_file_u32(const char* path, size_t offset, uint32_t value) {
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(out.is_open()) << path;
+    out.seekp(static_cast<std::streamoff>(offset));
+    out.write(reinterpret_cast<const char*>(&value), sizeof(uint32_t));
+    ASSERT_TRUE(out.good());
+}
+
+// A serialized index of each type that has a copying read. DiskSeismicIndex is
+// left out: its read_index throws whatever the version says, so it cannot show
+// what the version check alone rejects. It is covered over the mapped path
+// below.
+template <class Index>
+std::vector<uint8_t> serialized(Index* index) {
+    nsparse::BufferedIOWriter writer;
+    nsparse::write_index(index, &writer);
+    return writer.data();
+}
+
+}  // namespace
+
+// Every index type stamps its own current version into the header, and the
+// header lands where kIndexHeaderSize says the payload begins.
+TEST(IndexIOVersion, EachIndexTypeWritesItsCurrentFormatVersion) {
+    {
+        nsparse::SeismicIndex index(32);
+        const auto data = serialized(&index);
+        EXPECT_EQ(read_u32(data, 0),
+                  nsparse::fourcc(nsparse::SeismicIndex::name));
+        EXPECT_EQ(read_u32(data, version_offset(0)),
+                  nsparse::SeismicIndex::kFormatVersion);
+    }
+    {
+        nsparse::SeismicScalarQuantizedIndex index(32);
+        const auto data = serialized(&index);
+        EXPECT_EQ(read_u32(data, version_offset(0)),
+                  nsparse::SeismicScalarQuantizedIndex::kFormatVersion);
+    }
+    {
+        nsparse::InvertedIndex index(32);
+        const auto data = serialized(&index);
+        EXPECT_EQ(read_u32(data, version_offset(0)),
+                  nsparse::InvertedIndex::kFormatVersion);
+    }
+    {
+        nsparse::IDMapIndex index(new nsparse::SeismicIndex(32));
+        const auto data = serialized(&index);
+        EXPECT_EQ(read_u32(data, version_offset(0)),
+                  nsparse::IDMapIndex::kFormatVersion);
+    }
+}
+
+// A file from a build that postdates this one cannot be laid out here. Reading
+// the payload anyway would consume whatever the fields happen to align with, so
+// the version is what rejects it.
+TEST(IndexIOVersion, ReadIndexRejectsAVersionFromTheFuture) {
+    nsparse::SeismicIndex original(32);
+    auto data = serialized(&original);
+    patch_u32(data, version_offset(0),
+              nsparse::SeismicIndex::kFormatVersion + 1);
+
+    nsparse::BufferedIOReader reader(data);
+    try {
+        std::unique_ptr<nsparse::Index> loaded(nsparse::read_index(&reader));
+        ADD_FAILURE() << "accepted a version this build cannot read";
+    } catch (const std::runtime_error& error) {
+        // The message is checked, not just the type: a payload read past a
+        // dropped guard throws too, somewhere downstream, and that must not
+        // read as a pass.
+        const std::string what = error.what();
+        EXPECT_NE(what.find("SEIS"), std::string::npos) << what;
+        EXPECT_NE(what.find("format version"), std::string::npos) << what;
+    }
+}
+
+// Zero is not a version any writer produces, so a file declaring it is corrupt
+// rather than merely old.
+TEST(IndexIOVersion, ReadIndexRejectsAZeroVersion) {
+    nsparse::InvertedIndex original(32);
+    original.build();
+    auto data = serialized(&original);
+    patch_u32(data, version_offset(0), 0);
+
+    nsparse::BufferedIOReader reader(data);
+    try {
+        std::unique_ptr<nsparse::Index> loaded(nsparse::read_index(&reader));
+        ADD_FAILURE() << "accepted a zero version";
+    } catch (const std::runtime_error& error) {
+        const std::string what = error.what();
+        EXPECT_NE(what.find("INVT"), std::string::npos) << what;
+        EXPECT_NE(what.find("format version 0"), std::string::npos) << what;
+    }
+}
+
+// The version this build does write still reads, which is what keeps the check
+// from rejecting every file.
+TEST(IndexIOVersion, ReadIndexAcceptsTheVersionItWrites) {
+    nsparse::SeismicIndex original(32);
+    const auto data = serialized(&original);
+    ASSERT_EQ(read_u32(data, version_offset(0)),
+              nsparse::SeismicIndex::kFormatVersion);
+
+    nsparse::BufferedIOReader reader(data);
+    std::unique_ptr<nsparse::Index> loaded(nsparse::read_index(&reader));
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->get_dimension(), 32);
+}
+
+// Versions are numbered per index type, so a nested delegate carries its own
+// header rather than inheriting the wrapper's. Bumping IDMP must not implicate
+// SEIS, and vice versa.
+TEST(IndexIOVersion, ANestedDelegateCarriesItsOwnVersion) {
+    nsparse::IDMapIndex original(new nsparse::SeismicIndex(128));
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original.add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                          ids.data());
+
+    auto data = serialized(&original);
+
+    // IDMP's payload is the map size and the map itself; the delegate's header
+    // follows it.
+    const size_t map_size = ids.size();
+    const size_t delegate_header = nsparse::kIndexHeaderSize + sizeof(size_t) +
+                                   map_size * sizeof(nsparse::idx_t);
+    ASSERT_EQ(read_u32(data, delegate_header),
+              nsparse::fourcc(nsparse::SeismicIndex::name));
+    ASSERT_EQ(read_u32(data, version_offset(delegate_header)),
+              nsparse::SeismicIndex::kFormatVersion);
+
+    // Reached only because IDMapIndex::read_index delegates through
+    // detail::read_index, which re-reads a header of its own.
+    patch_u32(data, version_offset(delegate_header),
+              nsparse::SeismicIndex::kFormatVersion + 1);
+    nsparse::BufferedIOReader reader(data);
+    try {
+        std::unique_ptr<nsparse::Index> loaded(nsparse::read_index(&reader));
+        ADD_FAILURE() << "accepted a future version on the delegate";
+    } catch (const std::runtime_error& error) {
+        const std::string what = error.what();
+        EXPECT_NE(what.find("SEIS"), std::string::npos) << what;
+    }
+}
+
+// The check sits ahead of the mapped read as well as the copying one: mapping a
+// payload this build cannot lay out would borrow arrays at the wrong offsets,
+// which is worse than a copy that merely reads garbage.
+TEST(IndexIOVersion, MappedReadAlsoRejectsAVersionFromTheFuture) {
+    TempIndexFile file("nsparse_index_io_future_version_mmap.idx");
+    nsparse::InvertedIndex original(128);
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    original.add(2, indptr.data(), indices.data(), values.data());
+    original.build();
+    nsparse::write_index(&original, file.c_str());
+
+    // Sound before the patch, so the throw below is the version's doing.
+    {
+        std::unique_ptr<nsparse::Index> loaded(
+            nsparse::read_index(file.c_str(), nsparse::IndexIoFlag::kUseMmap));
+        ASSERT_NE(loaded, nullptr);
+    }
+
+    patch_file_u32(file.c_str(), version_offset(0),
+                   nsparse::InvertedIndex::kFormatVersion + 1);
+
+    for (const int flags :
+         {0, static_cast<int>(nsparse::IndexIoFlag::kUseMmap)}) {
+        try {
+            std::unique_ptr<nsparse::Index> loaded(
+                nsparse::read_index(file.c_str(), flags));
+            ADD_FAILURE() << "accepted the file, flags " << flags;
+        } catch (const std::runtime_error& error) {
+            const std::string what = error.what();
+            EXPECT_NE(what.find("format version"), std::string::npos)
+                << "flags " << flags << ": " << what;
+        }
+    }
+}
+
+// DiskSeismicIndex has no copying read, so the mapped path is the only place
+// its version can be checked -- and the check has to come first, before
+// read_index would throw its own mmap-only error.
+TEST(IndexIOVersion, MappedReadRejectsAFutureDiskSeismicVersion) {
+    TempIndexFile file("nsparse_index_io_dsei_future_version.idx");
+    nsparse::DiskSeismicIndex original(
+        5, {.lambda = 10, .beta = 2, .alpha = 0.5F});
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    original.add(2, indptr.data(), indices.data(), values.data());
+    original.build();
+    nsparse::write_index(&original, file.c_str());
+
+    ASSERT_NO_THROW({
+        std::unique_ptr<nsparse::Index> loaded(
+            nsparse::read_index(file.c_str(), nsparse::IndexIoFlag::kUseMmap));
+        ASSERT_NE(loaded, nullptr);
+    });
+
+    patch_file_u32(file.c_str(), version_offset(0),
+                   nsparse::DiskSeismicIndex::kFormatVersion + 1);
+    try {
+        std::unique_ptr<nsparse::Index> loaded(
+            nsparse::read_index(file.c_str(), nsparse::IndexIoFlag::kUseMmap));
+        ADD_FAILURE() << "accepted a future version";
+    } catch (const std::runtime_error& error) {
+        const std::string what = error.what();
+        EXPECT_NE(what.find("DSEI"), std::string::npos) << what;
+        EXPECT_NE(what.find("format version"), std::string::npos) << what;
+    }
 }

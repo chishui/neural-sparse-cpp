@@ -918,11 +918,9 @@ std::vector<idx_t> search_top(Index* index, term_t term, int k) {
     return labels;
 }
 
-// SparseVectors' element_size, counting past the fourcc and dimension
-// read_index consumes and past the vector count and dimension serialize()
-// wrote ahead of it.
-constexpr size_t kElementSizeOffset =
-    sizeof(uint32_t) + sizeof(int) + (2 * sizeof(size_t));
+// SparseVectors' element_size, counting past the header read_index consumes and
+// past the vector count and dimension serialize() wrote ahead of it.
+constexpr size_t kElementSizeOffset = kIndexHeaderSize + (2 * sizeof(size_t));
 
 template <class T>
 T read_field(const std::string& path, size_t offset) {

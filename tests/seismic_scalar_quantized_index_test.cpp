@@ -997,9 +997,9 @@ private:
 };
 #endif
 
-// Where read_index leaves off before the payload: the fourcc and the dimension.
-// SESQ's payload opens with the quantizer header write_header wrote.
-constexpr size_t kQuantizerTypeOffset = sizeof(uint32_t) + sizeof(int);
+// Where read_index leaves off before the payload. SESQ's payload opens with the
+// quantizer header write_quantizer_header wrote.
+constexpr size_t kQuantizerTypeOffset = kIndexHeaderSize;
 constexpr size_t kVminOffset = kQuantizerTypeOffset + sizeof(QuantizerType);
 
 template <class T>
