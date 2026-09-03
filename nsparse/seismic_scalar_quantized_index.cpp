@@ -191,11 +191,11 @@ ScalarQuantizer SeismicScalarQuantizedIndex::query_quantizer(
 }
 
 void SeismicScalarQuantizedIndex::build() {
-    clustered_inverted_lists = std::move(detail::build_inverted_lists_clusters(
-        get_vectors(),
-        {.element_size = sq_.bytes_per_value(),
-         .dimension = static_cast<size_t>(get_dimension())},
-        cluster_parameter_));
+    // add() has already quantized the values, so the shared build reads their
+    // width off the corpus and needs to know nothing of the quantizer.
+    clustered_inverted_lists = detail::build_clustered_lists(
+        get_vectors(), static_cast<size_t>(get_dimension()), cluster_parameter_,
+        &batch_spill_);
 }
 
 auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
@@ -262,14 +262,14 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
         dynamic_cast<const SeismicSearchParameters*>(search_parameters);
     const auto* parameters =
         seismic_parameters != nullptr ? seismic_parameters : &default_params;
-    const size_t dense_bytes =
-        static_cast<size_t>(dimension_) * element_size;
+    const size_t dense_bytes = static_cast<size_t>(dimension_) * element_size;
 
     // Per-thread scratch reused across all queries a thread handles: a
-    // dimension-sized quantized-code dense buffer (kept all-zero between queries
-    // via a sparse clear inside single_query) and the visited-doc set. This
-    // replaces the previous per-query allocation of both. schedule(dynamic, 64)
-    // matches the coarse-chunk scheduling used by SeismicIndex::search.
+    // dimension-sized quantized-code dense buffer (kept all-zero between
+    // queries via a sparse clear inside single_query) and the visited-doc set.
+    // This replaces the previous per-query allocation of both.
+    // schedule(dynamic, 64) matches the coarse-chunk scheduling used by
+    // SeismicIndex::search.
 #pragma omp parallel
     {
         std::vector<uint8_t> dense(dense_bytes, 0);
@@ -285,9 +285,8 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
             std::vector<term_t> cuts;
             if (element_size == U16) {
                 cuts = detail::top_k_tokens<uint16_t>(
-                    q_indices,
-                    reinterpret_cast<const uint16_t*>(q_val_bytes), len,
-                    parameters->cut);
+                    q_indices, reinterpret_cast<const uint16_t*>(q_val_bytes),
+                    len, parameters->cut);
             } else {
                 cuts = detail::top_k_tokens<uint8_t>(q_indices, q_val_bytes,
                                                      len, parameters->cut);
@@ -315,11 +314,12 @@ auto SeismicScalarQuantizedIndex::single_query(
         return {{}, {}};
     }
 
-    // Scatter the query's quantized codes into the reused dense buffer (all-zero
-    // on entry): element_size contiguous bytes per non-zero dim.
+    // Scatter the query's quantized codes into the reused dense buffer
+    // (all-zero on entry): element_size contiguous bytes per non-zero dim.
     for (size_t i = 0; i < q_len; ++i) {
-        std::copy_n(q_val_bytes + i * element_size, element_size,
-                    dense.data() + static_cast<size_t>(q_idx[i]) * element_size);
+        std::copy_n(
+            q_val_bytes + i * element_size, element_size,
+            dense.data() + static_cast<size_t>(q_idx[i]) * element_size);
     }
     visited.clear();
 
@@ -431,7 +431,8 @@ void SeismicScalarQuantizedIndex::write_quantization_header(
     io_writer->write(&vmax, sizeof(float), 1);
 }
 
-void SeismicScalarQuantizedIndex::read_quantization_header(IOReader* io_reader) {
+void SeismicScalarQuantizedIndex::read_quantization_header(
+    IOReader* io_reader) {
     QuantizerType sq_type = QuantizerType::QT_8bit;
     float vmin = 0.0F;
     float vmax = 1.0F;

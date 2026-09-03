@@ -224,6 +224,163 @@ cmake --build build -j
 
 On Linux, the benchmarks support hardware performance counters via [libpfm](http://perfmon2.sourceforge.net/). Install `libpfm4-dev` to enable this.
 
+## Building an index larger than memory
+
+A whole-corpus build holds two intermediates that scale with the corpus's
+non-zeros — the inverted lists (every posting) and then the clustered posting
+lists — so peak memory scales with the corpus, and a corpus whose posting lists
+do not fit in RAM cannot be indexed at all.
+
+Batching splits the term space into contiguous windows and finishes one window
+before starting the next. It is a build option on the seismic family rather than
+a separate entry point, so it is set in the factory description alongside
+`lambda` and `beta`, and every type in the family gets it — `seismic`,
+`seismic_sq`, `disk_seismic`, `disk_seismic_sq`:
+
+| Option | Effect |
+|---|---|
+| `inverted_list_batch_size=N` | Build in `N` term windows, bounding the inverted-list intermediate to one window. Ignored without `batch_file_output_path`: the clustered lists would accumulate for the whole corpus anyway, so the peak would barely move while the build paid a corpus pass per window. |
+| `batch_file_output_path=P` | An existing directory the build may spill windows into. With `N > 1`, each window's clustered lists are written there and freed as they are produced, then borrowed back by mapping the spill, so the clustered lists are never all resident either. Unused at `N <= 1`, which is an ordinary build with nothing to spill. |
+
+So both together or neither: either knob alone leaves an ordinary whole-corpus
+build.
+
+`P` is scratch, not output. `build()` writes no index and leaves nothing in that
+directory — the spill is unlinked as soon as it is mapped, and the lists go on
+being read from the mapping — so serializing an index is still `write_index`'s
+job, and the index it writes is byte-for-byte what a whole-corpus build would
+have produced.
+
+```cpp
+auto* index = nsparse::index_factory(
+    dimension,
+    "seismic,lambda=6000|beta=400|alpha=0.4"
+    "|inverted_list_batch_size=10|batch_file_output_path=/scratch");
+
+// Corpus residency is SparseVectors' business, not the build's: read_csr can
+// map a native-layout CSR instead of copying it, and the build is unchanged.
+index->read_csr("corpus.mcsr", nsparse::Residency::kMmap);
+index->build();   // one window at a time, spilling to /scratch
+
+// Serialized the ordinary way, from the lists the build ended holding.
+nsparse::write_index(index, "/data/index.dat");
+
+// And servable as it stands: the posting lists are borrowed from the spill's
+// mapping, and the corpus is still borrowed from its own.
+index->search(...);
+```
+
+The same from Python, since it is only a description string:
+
+```python
+native = nsparse.native_path("corpus.csr")
+nsparse.convert("corpus.csr", native)
+index = nsparse.index_factory(
+    dim,
+    "seismic,lambda=6000|beta=400|alpha=0.4"
+    "|inverted_list_batch_size=10|batch_file_output_path=/scratch",
+)
+index.read_csr(native, nsparse.Residency_kMmap)
+index.build()                                  # spills to /scratch
+nsparse.write_index(index, "/data/index.dat")  # the index file, as usual
+dists, labels = index.search(n, indptr, indices, values, k)
+```
+
+That the two are the same index is asserted rather than assumed: at a fixed
+`seed` a batched build and a whole-corpus one are compared as files, for all four
+types. Each posting list's k-means seed comes from its own *global* term id and
+`lambda`/`beta` are resolved once from the whole corpus, so the window count
+cannot change what is produced.
+
+What the spill does cost is disk while the index lives: an unlinked file still
+occupies its blocks until the last mapping of it goes, so budget the clustered
+lists' size on that filesystem for as long as the index object is around, on top
+of whatever `write_index` then writes.
+
+### Choosing `inverted_list_batch_size`
+
+Windows are cut to equal estimated *memory*, not equal width. Term frequencies are
+heavily skewed, and peak memory is set by the largest window, so an uneven split
+wastes most of what batching could save.
+
+A window has two memory peaks and the split has to weigh both. Filling it holds
+every posting of its terms; clustering it holds what survives pruning
+(`min(count, lambda)` per term) as clusters and summaries, an order of magnitude
+bulkier per posting. Weighting either phase alone unbalances the other, both worse
+than weighting their sum — see `make_windows` in `nsparse/seismic_common.cpp`.
+
+That ratio is also why the window count does nothing on its own: it bounds the
+fill, and the clustered lists — the bulkier peak — are what a spill directory
+bounds.
+
+`RssAnon` is the figure to watch, being what the process itself allocated;
+`RssFile` is pages it touched of a mapping, which the kernel can reclaim under
+pressure. Read as total RSS the win looks far smaller than it is: an index that
+maps its corpus, and then maps its spill back, keeps most of its residency in page
+cache, which total RSS counts and pressure reclaims. Batching moves the anonymous
+column, so report the split rather than the total.
+
+What to expect from the shape of it: anonymous memory falls faster than 1/N,
+because the split comes from the real per-term costs rather than from term ids,
+and build time is flat to around ten windows and then climbs, because every window
+makes its own pass over the corpus. Ten to twenty windows is usually the useful
+range — most of the memory saving for a few percent of build time. The floor is
+what the build cannot batch: one window plus whatever the corpus itself costs.
+
+All four types behave alike here, since they share the build. What differs is what
+`write_index` then costs them: the disk-resident pair's inline forward index copies
+every pruned posting's whole doc vector, so at a large `lambda` that section alone
+can dwarf the rest of the index. And `disk_seismic_sq` cannot map a float CSR (it
+searches over codes), so its corpus stays on the heap and shows up in the same
+column the build's own growth does; subtract the reported `start_rss_anon_mb`.
+
+Borrowing the lists back from the spill is nearly free in the column that matters:
+it costs a fraction of a second and single-digit megabytes of anonymous memory,
+against copying them, which costs their whole size — the cursor reads the size
+header before each array and skips the bulk, so it faults in part of the file as
+reclaimable page cache. That mapping is separate from the corpus's: an index that
+mapped its corpus with `read_csr` keeps doing so, since it still scores from it.
+
+Compare like with like. A build that loads the corpus is not comparable to one
+that maps it, and the difference is more than the corpus: a streaming ingest
+stages a second copy that the allocator retains rather than returning to the OS,
+so do not read a heap figure and a mapped figure as differing by a fixed offset.
+Measure from the start of the build with the corpus already resident, or a
+whole-process high-water mark reports the loader and hides everything below it.
+Peak RSS comes from `VmHWM`, a kernel counter; the anon and file peaks have no
+such counter and are sampled, so they are lower bounds and can disagree with
+`VmHWM` by a hair.
+
+Query performance does not move, because the index is the same index: identical
+byte for byte at a fixed seed, and indistinguishable in latency, QPS and recall
+for the random-seeded default.
+
+Point the spill directory at a real disk. On a tmpfs such as `/tmp` it is RAM,
+which defeats the point.
+
+### Measuring it
+
+`benchmarks/batched_build_mem_bench` reports peak RSS (`VmHWM`) and wall time for
+one configuration per process — `google-benchmark` measures throughput, and a
+high-water mark is only clean in a process that has built nothing else. It times
+`build()` alone; the index is written afterwards, outside the measurement, only to
+report its size. Use `inmem` to compare against `baseline`: both then hold the
+corpus on the heap, so the difference is the batching rather than the residency.
+
+```bash
+cmake -S . -B build -DNSPARSE_ENABLE_BENCHMARKS=ON && cmake --build build -j
+B=./build/benchmarks/batched_build_mem_bench
+$B convert corpus.csr corpus.mcsr
+$B baseline corpus.csr 6000 400 0.4                  # whole-corpus build, for reference
+$B batched inmem corpus.csr 6000 400 0.4 10 /scratch # 10 windows, same corpus residency
+$B batched mmap corpus.mcsr 6000 400 0.4 10 /scratch # ... or with the corpus mapped
+
+# Any type in the family, as its factory name. Both arms need it, and the
+# baseline's index path is positional -- pass "" to skip writing one.
+$B baseline corpus.csr 6000 400 0.4 "" disk_seismic
+$B batched mmap corpus.mcsr 6000 400 0.4 10 /scratch disk_seismic
+```
+
 ## Python Bindings
 
 ### Build Python Bindings

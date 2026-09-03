@@ -142,11 +142,9 @@ void SeismicIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
 }
 
 void SeismicIndex::build() {
-    clustered_inverted_lists = std::move(detail::build_inverted_lists_clusters(
-        get_vectors(),
-        {.element_size = kElementSize,
-         .dimension = static_cast<size_t>(get_dimension())},
-        cluster_parameter_));
+    clustered_inverted_lists = detail::build_clustered_lists(
+        get_vectors(), static_cast<size_t>(get_dimension()), cluster_parameter_,
+        &batch_spill_);
 }
 
 auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
