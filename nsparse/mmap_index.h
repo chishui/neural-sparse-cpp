@@ -51,21 +51,24 @@ public:
     }
 
 protected:
-    // The mapping borrowed buffers point into: a native CSR file via read_csr,
-    // or a serialized index file. Those sources are mutually exclusive, so one
-    // member serves both.
+    // The two mappings borrowed buffers can point into, kept apart because they
+    // are populated by unrelated paths and released independently: a native CSR
+    // corpus opened by read_csr's mapped residency, and a serialized index file
+    // opened by a derived mmap_index.
     //
-    // Borrowers do not reference it, so it must outlive them. Members are
-    // destroyed in reverse declaration order, hence this one first: do not
-    // reorder it past anything that borrows from it.
-    MmapFile mapped_file_;
+    // Borrowers do not reference either one, so both must outlive them. Members
+    // are destroyed in reverse declaration order, hence these first: do not
+    // reorder them past anything that borrows from them.
+    MmapFile csr_mapping_;
+    MmapFile index_mapping_;
 
     // Either residency: buffers owned when built or deserialized, borrowed from
-    // mapped_file_ when mapped. get_vectors() cannot tell the two apart.
+    // csr_mapping_ or index_mapping_ when mapped. get_vectors() cannot tell the
+    // cases apart.
     std::unique_ptr<SparseVectors> vectors_;
 
     // A batched build's spill, which its posting lists borrow from. Separate
-    // from mapped_file_ because the two coexist: the corpus may itself be a
+    // from csr_mapping_ because the two coexist: the corpus may itself be a
     // mapping vectors_ is still borrowing from.
     //
     // Its borrowers live in the derived class, destroyed before base members,
@@ -155,7 +158,7 @@ private:
                 nnz_size * element_size));
 
         // Committed last, so a rejected file leaves the index untouched.
-        mapped_file_ = std::move(file);
+        csr_mapping_ = std::move(file);
         vectors_ = std::move(vectors);
     }
 };
