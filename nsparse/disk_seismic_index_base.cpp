@@ -194,9 +194,9 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     // width mismatch before we commit.
     validate_mapped_payload();
 
-    // mapped_file_ last: the summaries and the forward index borrow from it,
+    // index_mapping_ last: the summaries and the forward index borrow from it,
     // and moving it does not move the mapping.
-    mapped_file_ = std::move(mapped);
+    index_mapping_ = std::move(mapped);
 }
 
 }  // namespace nsparse

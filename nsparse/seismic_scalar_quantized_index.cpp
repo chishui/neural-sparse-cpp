@@ -400,14 +400,14 @@ SeismicScalarQuantizedIndex* SeismicScalarQuantizedIndex::mmap_index(
     inv_list_writer.mmap_deserialize(&cursor);
 
     // Committed only once everything parsed, so a corrupt file cannot leave a
-    // half-mapped index behind. mapped_file_ last: the arrays above borrow from
-    // it, and moving it does not move the mapping itself.
+    // half-mapped index behind. index_mapping_ last: the arrays above borrow
+    // from it, and moving it does not move the mapping itself.
     index->sq_ = sq;
     index->clustered_inverted_lists = std::move(inv_list_writer.release());
     if (vectors->num_vectors() > 0) {
         index->vectors_ = std::move(vectors);
     }
-    index->mapped_file_ = std::move(mmap_file);
+    index->index_mapping_ = std::move(mmap_file);
     return index.release();
 }
 

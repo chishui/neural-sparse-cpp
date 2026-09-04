@@ -278,7 +278,7 @@ void InvertedIndex::build() {
     vectors_.reset();
     // The posting lists own their entries, so nothing borrows from a mapped CSR
     // once the vectors are gone.
-    mapped_file_.close();
+    csr_mapping_.close();
 
     // Posting lists are already sorted by doc_id because
     // build_inverted_lists iterates documents in ascending order.
@@ -471,14 +471,14 @@ InvertedIndex* InvertedIndex::mmap_index(const IndexHeader& header,
     throw_if_scores_are_incomplete(*lists, scores_size);
 
     // Committed only once everything parsed, so a corrupt file cannot leave a
-    // half-mapped index behind. mapped_file_ last: the arrays above borrow from
-    // it, and moving it does not move the mapping itself.
+    // half-mapped index behind. index_mapping_ last: the arrays above borrow
+    // from it, and moving it does not move the mapping itself.
     index->num_vectors_ = num_vectors;
     index->max_term_scores_ = std::move(scores);
     if (lists->size() > 0) {
         index->inverted_lists_ = std::move(lists);
     }
-    index->mapped_file_ = std::move(mmap_file);
+    index->index_mapping_ = std::move(mmap_file);
     return index.release();
 }
 
