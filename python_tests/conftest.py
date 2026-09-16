@@ -8,9 +8,8 @@
 """Fixtures for the black-box index tests.
 
 Everything here goes through the installed extension module and the SWIG
-surface only. Two harness guards run before any test, because both failure
-modes are silent: a shadowed import gives an incomplete module, and a
-mismatched numpy corrupts arrays rather than erroring.
+surface only. One harness guard runs before any test, because its failure mode
+is silent: a shadowed import gives an incomplete module rather than an error.
 """
 
 import os
@@ -39,7 +38,7 @@ QUERY_SEED = 0xBEEF
 
 
 def pytest_configure(config):
-    """Fail loudly on the two silent harness failure modes."""
+    """Fail loudly on the silent harness failure mode."""
     # Importing from the repo root resolves the source tree `nsparse/` as a
     # namespace package (__file__ is None) when the extension is not installed.
     # The result is a module without index_factory, which reads as a test bug.
@@ -48,16 +47,8 @@ def pytest_configure(config):
     ):
         raise pytest.UsageError(
             f"nsparse resolved to an incomplete module ({nsparse.__file__!r}). "
-            "Install the built extension: pip install --no-deps "
+            "Install the built extension: pip install "
             "build/nsparse/python"
-        )
-    # nsparse/python/pyproject.toml pins numpy<2.0. A newer numpy than the one
-    # the extension was compiled against corrupts arrays at runtime instead of
-    # failing to import, which would look like a search regression.
-    if int(np.__version__.split(".")[0]) >= 2:
-        raise pytest.UsageError(
-            f"numpy {np.__version__} is incompatible with these bindings "
-            "(pyproject pins numpy<2.0); results would be silently corrupt."
         )
 
 

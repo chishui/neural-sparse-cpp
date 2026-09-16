@@ -17,6 +17,14 @@ find_package(Python REQUIRED
   COMPONENTS Interpreter Development.Module NumPy
 )
 
+# A module built against numpy 2.x headers loads on numpy 1.x and 2.x; one built
+# against 1.x cannot import under 2.x, which pyproject.toml permits.
+if(Python_NumPy_VERSION VERSION_LESS 2.0)
+  message(FATAL_ERROR "numpy>=2.0 headers are required to build the bindings; "
+    "found ${Python_NumPy_VERSION} for ${Python_EXECUTABLE} "
+    "(pip install -r nsparse/python/requirements.txt).")
+endif()
+
 find_package(SWIG REQUIRED COMPONENTS python)
 include(${SWIG_USE_FILE})
 

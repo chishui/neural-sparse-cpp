@@ -164,6 +164,10 @@ jobs:
     needs: check-files
     if: needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -173,18 +177,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y swig
 
-      # Pinned to 3.12 because nsparse/python/pyproject.toml requires numpy<2.0,
-      # and numpy 1.26 is the last release supporting that constraint. On 3.13+
-      # the pin resolves to a numpy older than the interpreter, which corrupts
-      # arrays at runtime rather than failing to install.
       - name: Set up Python
         id: python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install build dependencies
-        run: python -m pip install --upgrade pip "numpy<2.0" packaging setuptools wheel pytest
+        run: python -m pip install --upgrade pip -r nsparse/python/requirements.txt packaging setuptools wheel pytest
 
       - name: Configure
         run: |
@@ -197,13 +197,10 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
-      # --no-deps keeps the numpy installed above. Letting pip re-resolve here can
-      # swap numpy after the extension was compiled against its headers, and a
-      # mismatched pair corrupts search results instead of erroring.
       - name: Install the built package
         run: |
           cd build/nsparse/python
-          python -m pip install --no-deps .
+          python -m pip install .
 
       - name: Import check
         run: python -c "import nsparse; print(nsparse.index_factory)"
@@ -214,6 +211,13 @@ jobs:
       # that its xfail marker should be removed.
       - name: Run Python tests
         run: python -m pytest python_tests -v -rX
+
+      # The floor pyproject.toml declares, exactly. 3.13 has no numpy 1.x wheel.
+      - name: Run Python tests on the numpy floor
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m pip install "numpy==1.26.0"
+          python -m pytest python_tests -v -rX
 
   Build-nsparse-MacOS:
     name: Build and Test nsparse on MacOS

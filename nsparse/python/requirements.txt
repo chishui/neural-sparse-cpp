@@ -1,1 +1,2 @@
+# Build-time headers only; the runtime bound is in pyproject.toml.
 numpy>=2.0

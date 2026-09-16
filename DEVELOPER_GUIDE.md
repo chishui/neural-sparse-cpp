@@ -186,12 +186,15 @@ cover the internals SWIG deliberately hides (`MmapCursor`, borrowing
 They need the bindings built and installed:
 
 ```bash
+pip install -r nsparse/python/requirements.txt pytest   # numpy 2.x headers for the build
 cmake -S . -B build -DNSPARSE_ENABLE_PYTHON=ON
 cmake --build build -j
-pip install "numpy<2.0" pytest
-pip install --no-deps build/nsparse/python
+pip install build/nsparse/python
 pytest python_tests -v
 ```
+
+The bindings are compiled against the numpy present at configure time, which
+must be 2.x; a module built that way runs on numpy 1.26+ and 2.x.
 
 One file per index type, named after the use case being exercised
 (`test_happy_case`, `test_with_id_map`, `test_exact_match`, ...). Accuracy is

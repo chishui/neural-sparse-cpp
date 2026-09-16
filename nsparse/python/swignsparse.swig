@@ -11,6 +11,9 @@
 
 %{
 #define SWIG_FILE_WITH_INIT
+// Pin the C-API floor (the 1.25/1.26 level) rather than inherit whatever the
+// numpy 2.x providing the headers defaults to. The package floor is pyproject's.
+#define NPY_TARGET_VERSION NPY_1_25_API_VERSION
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <new>
 #include <stdexcept>

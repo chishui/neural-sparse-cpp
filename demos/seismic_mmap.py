@@ -35,13 +35,6 @@ the bindings do not hand out the raw CSR pointers.
 Usage:
     python demos/seismic_mmap.py <data.csr> <queries.csr> [options]
 
-Needs a numpy that supports the running interpreter. Installing the nsparse
-package pulls numpy<2.0 (see pyproject.toml), and on Python 3.13+ that resolves
-to a numpy released before the interpreter existed, which silently corrupts live
-arrays: `a - b` overwrites `a`, so scores turn to zeros midway through a run
-while every check still passes. Install numpy>=2.1 over it (pip complains about
-the pin; the complaint is the bug, not the fix).
-
 Exits non-zero if any check fails.
 """
 
