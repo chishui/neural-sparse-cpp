@@ -30,7 +30,7 @@ struct DiskSeismicSQSearchParameters : public DiskSeismicSearchParameters {
     float vmin;
     float vmax;
     DiskSeismicSQSearchParameters(float vmin, float vmax, int cut, int k_prime,
-                                  int rescore = kDefaultRescoreDepth)
+                                  int rescore = kAutoRescoreDepth)
         : DiskSeismicSearchParameters(cut, k_prime, rescore),
           vmax(vmax),
           vmin(vmin) {}

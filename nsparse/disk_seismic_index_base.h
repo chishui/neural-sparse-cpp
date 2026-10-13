@@ -106,8 +106,10 @@ protected:
 
     // Reads the shared payload (doc count, summaries, inline forward) from the
     // cursor, validates it, and commits the mapping. Each concrete mmap_index
-    // reads its own extra header first, then calls this.
-    void load_mapped_payload(MmapCursor* cursor, MmapFile&& mapped);
+    // reads its own extra header first, then calls this with the file's
+    // format version (both disk types share the numbering: 2 added truncation).
+    void load_mapped_payload(MmapCursor* cursor, MmapFile&& mapped,
+                             uint32_t format_version);
 
     // Maps a disk index file for querying. Every disk index is point-accessed
     // (~k' small inline-forward blocks per query), so the mapping must use
@@ -151,6 +153,9 @@ private:
     // The store the re-scoring pass reads, or an empty one when this index has
     // no locator table (a fresh in-RAM build).
     [[nodiscard]] detail::FullVectorStore full_vector_store() const;
+    // Rejects a locator that points outside the directory or the remainder
+    // store. Checked once at load, so search never meets one mid-query.
+    void validate_doc_locators() const;
     // Scores every selected doc directly through the doc-locator directory, for
     // a mapped index. Requires doc_locators_ populated.
     [[nodiscard]] auto exact_match_directory(

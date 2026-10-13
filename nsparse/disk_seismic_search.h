@@ -47,6 +47,12 @@ struct DiskSeismicCutBudget {
 DiskSeismicCutBudget resolve_cut_and_budget(
     const SearchParameters* search_parameters);
 
+// The re-scoring depth a search runs at: kAutoRescoreDepth resolves to
+// max(kAutoRescoreMinDepth, kAutoRescorePerK * k), anything else is raised to k
+// (fewer than k re-scored candidates could not fill the result). Expects a
+// non-negative `rescore`.
+int resolve_rescore_depth(int rescore, int k);
+
 // The second scoring pass, for an index whose inline copies are truncated: where
 // the whole vectors are, how many candidates to re-score, and the per-thread
 // scratch the batched resolve needs. One per query thread, reused across
@@ -79,10 +85,11 @@ pair_of_score_id_vectors_t initialize_padded_results(idx_t n, int k);
 // and pads to k.
 //
 // When `rescore` is non-null the blocks hold truncated copies, so block scores
-// are lower bounds and a second pass is required: its `depth` best candidates by
-// block score are scored again against their untruncated vectors and that
-// ranking is returned. Pass null when every copy is whole, which is the only
-// correct choice then -- a second pass would score the same bytes twice.
+// are lower bounds and a second pass is required: its `depth` best candidates
+// by block score (at least k, at most the pool the selected blocks hold) are
+// scored again against their untruncated vectors and that ranking is returned.
+// Pass null when every copy is whole, which is the only correct choice then --
+// a second pass would score the same bytes twice.
 pair_of_score_id_vector_t block_budget_query(
     uint8_t* dense, size_t element_size, absl::flat_hash_set<idx_t>& visited,
     std::vector<BlockCandidate>& candidates, std::vector<float>& score_scratch,

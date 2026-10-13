@@ -47,6 +47,16 @@ class TestDiskSeismicSQ(DiskSeismicContract):
             return nsparse.DiskSeismicSQSearchParameters(VMIN, VMAX, cut, k_prime)
         return nsparse.DiskSeismicSQSearchParameters(VMIN, VMAX, cut, k_prime, rescore)
 
+    def test_parameters_take_keywords(self):
+        """The constructor keeps its keyword arguments, rescore= included."""
+        p = nsparse.DiskSeismicSQSearchParameters(vmin=0.0, vmax=3.0, cut=3, k_prime=50)
+        assert (p.vmin, p.vmax, p.cut, p.k_prime) == (0.0, 3.0, 3, 50)
+        assert p.rescore == nsparse.kAutoRescoreDepth
+        p = nsparse.DiskSeismicSQSearchParameters(
+            vmin=0.0, vmax=3.0, cut=3, k_prime=50, rescore=7
+        )
+        assert p.rescore == 7
+
     # --- quantization-specific ---
 
     @pytest.mark.parametrize("width", ["8bit", "16bit"])

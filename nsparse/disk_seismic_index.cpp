@@ -59,7 +59,7 @@ DiskSeismicIndex* DiskSeismicIndex::mmap_index(const IndexHeader& header,
     cursor.skip(pos);
 
     // No extra header for the float index; the shared payload follows directly.
-    index->load_mapped_payload(&cursor, std::move(mmap_file));
+    index->load_mapped_payload(&cursor, std::move(mmap_file), header.version);
     return index.release();
 }
 }  // namespace nsparse

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "nsparse/disk_seismic_index.h"
+#include "nsparse/disk_seismic_search.h"
 #include "nsparse/index.h"
 #include "nsparse/index_factory.h"
 #include "nsparse/io/index_io.h"
@@ -188,7 +189,7 @@ int do_search(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "search <dat> <queries.csr> <k> <reps> <inmem|mmap> "
                      "[truth.txt|-] [cut] [k_prime] [heap_factor] "
-                     "[labels_out.txt]\n";
+                     "[labels_out.txt|-] [rescore|-]\n";
         return 2;
     }
     std::string dat_path = argv[2];
@@ -211,9 +212,12 @@ int do_search(int argc, char** argv) {
     const std::string labels_out_path =
         (argc > 11 && std::strcmp(argv[11], "-") != 0) ? argv[11] : "";
     // Candidates re-scored against their whole vectors, for an index whose
-    // inline copies are truncated (inline_max_nnz). 0 = the build's default; a
-    // whole-copy index ignores it either way.
-    const int rescore = argc > 12 ? std::atoi(argv[12]) : 0;
+    // inline copies are truncated (inline_max_nnz); absent or "-" is the
+    // library's automatic depth, and anything else is passed through as given
+    // (so a negative is rejected by search). A whole-copy index ignores it.
+    const int rescore = (argc > 12 && std::strcmp(argv[12], "-") != 0)
+                            ? std::stoi(argv[12])
+                            : nsparse::kAutoRescoreDepth;
 
     const int io_flags =
         residency == "mmap" ? nsparse::IndexIoFlag::kUseMmap : 0;
@@ -242,15 +246,13 @@ int do_search(int argc, char** argv) {
 
     std::unique_ptr<nsparse::SeismicSearchParameters> params;
     if (k_prime > 0) {
-        params = rescore > 0
-                     ? std::make_unique<nsparse::DiskSeismicSearchParameters>(
-                           cut, k_prime, rescore)
-                     : std::make_unique<nsparse::DiskSeismicSearchParameters>(
-                           cut, k_prime);
+        params = std::make_unique<nsparse::DiskSeismicSearchParameters>(
+            cut, k_prime, rescore);
         std::cout << "search_params cut " << cut << " k_prime " << k_prime
-                  << " rescore "
-                  << (rescore > 0 ? rescore : nsparse::kDefaultRescoreDepth)
-                  << "\n";
+                  << " rescore " << rescore << " (effective "
+                  << nsparse::detail::resolve_rescore_depth(
+                         std::max(rescore, 0), k)
+                  << ")\n";
     } else {
         params = std::make_unique<nsparse::SeismicSearchParameters>(cut, heap_factor);
         std::cout << "search_params cut " << cut << " heap_factor " << heap_factor << "\n";

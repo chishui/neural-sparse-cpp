@@ -180,18 +180,31 @@ public:
     // The directory entry for (pl, block), or null when the block is absent.
     // Exposed so a batched walk can prefetch the entry before dereferencing it.
     const InlineDirEntry* dir_entry(uint32_t pl, uint32_t block) const;
-    // One doc's slice out of an already-located block. Reads only off[slot],
-    // off[slot + 1] and off[n_docs], where block() validates the whole block --
-    // worth separating because the re-scoring pass wants one doc out of a block
-    // it will not otherwise touch. Still fail-closed: the slot and the block
-    // length are checked, so a corrupt entry cannot yield an out-of-range slice.
-    DocSlice doc_slice(const InlineDirEntry& entry, uint32_t slot) const;
+    // One doc's slice out of an already-located block. Reads only
+    // doc_id[slot], off[slot], off[slot + 1] and off[n_docs], where block()
+    // validates the whole block -- worth separating because the re-scoring pass
+    // wants one doc out of a block it will not otherwise touch. Still
+    // fail-closed: the slot, the block length, and that the slot holds `doc_id`
+    // are checked, so a corrupt entry or locator cannot yield another doc's or
+    // an out-of-range slice.
+    DocSlice doc_slice(const InlineDirEntry& entry, uint32_t slot,
+                       uint32_t doc_id) const;
+    // For a file written before max_doc_nnz existed: its header bytes there
+    // were padding, so never read them as a limit.
+    void ignore_max_doc_nnz() { max_doc_nnz_ = 0; }
 
 private:
-    // n_docs and total_nnz of a block, from a validated doc-id span.
+    // n_docs and total_nnz of a block, from a validated doc-id span, and
+    // whether any copy in it is cut short.
     struct BlockCounts {
         uint32_t n_docs;
         uint64_t total_nnz;
+        bool truncates;
+    };
+    // Byte length of the section body, and whether any copy is truncated.
+    struct SectionSize {
+        uint64_t length;
+        bool truncates;
     };
     // page_size when page-aligned, else kMinBlockAlign (packed).
     uint64_t write_alignment() const {
@@ -199,7 +212,7 @@ private:
                                                            : kMinBlockAlign;
     }
     // Validate a block's doc ids and return its counts; total_nnz is capped at
-    // INT32_MAX so off[] stays idx_t-convertible. Shared by section_length()
+    // INT32_MAX so off[] stays idx_t-convertible. Shared by section_size()
     // (sizing) and write_body() (emitting) so their per-block math can't drift,
     // which is also why it must know which block it is: a doc contributes its
     // whole nnz to one block and a truncated nnz to the rest.
@@ -232,13 +245,14 @@ private:
                                 uint64_t nnz, size_t element_size, CodeCut cut,
                                 std::vector<term_t>* comps_out,
                                 std::vector<uint8_t>* vals_out);
-    // Byte length of the section body, from a payload-free sizing pass over
-    // lists + indptr. Lets serialize() write the length prefix without first
-    // rendering the body into a buffer.
-    uint64_t section_length() const;
+    // The section body's size, from a payload-free sizing pass over lists +
+    // indptr. Lets serialize() write the length prefix without first rendering
+    // the body into a buffer.
+    SectionSize section_size() const;
     // Stream the section body (header, blocks, directory, trailer) straight to
     // the writer; serialize() precedes it with padding + the length prefix.
-    void write_body(IOWriter* writer) const;
+    // `max_doc_nnz` is what the header records.
+    void write_body(IOWriter* writer, uint32_t max_doc_nnz) const;
     // Validate the section at [base, base + section_len) and load its directory
     // into RAM; sets element_size_/page_size_/entries_/list_offset_.
     void load_directory(const uint8_t* base, size_t section_len);

@@ -199,6 +199,10 @@ import_array();
 // The disk-resident indexes derive from DiskSeismicIndexBase (itself a
 // MmapIndex), so SWIG needs the base first or the Python classes lose their
 // inherited search / num_vectors / add.
+// One wrapper with keyword arguments, rescore= included: a defaulted parameter
+// would otherwise split into overloads, which SWIG wraps as *args only.
+%feature("compactdefaultargs") nsparse::DiskSeismicSQSearchParameters::DiskSeismicSQSearchParameters;
+%feature("kwargs") nsparse::DiskSeismicSQSearchParameters::DiskSeismicSQSearchParameters;
 %include "nsparse/disk_seismic_index_base.h"
 %include "nsparse/disk_seismic_index.h"
 %include "nsparse/disk_seismic_scalar_quantized_index.h"

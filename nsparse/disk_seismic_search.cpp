@@ -8,11 +8,9 @@
  */
 
 #include "nsparse/disk_seismic_search.h"
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -139,6 +137,15 @@ DiskSeismicCutBudget resolve_cut_and_budget(
     return {cut, k_prime, rescore};
 }
 
+int resolve_rescore_depth(int rescore, int k) {
+    if (rescore == kAutoRescoreDepth) {
+        const int64_t scaled = static_cast<int64_t>(kAutoRescorePerK) * k;
+        return static_cast<int>(std::min<int64_t>(
+            std::max<int64_t>(kAutoRescoreMinDepth, scaled), INT32_MAX));
+    }
+    return std::max(rescore, k);
+}
+
 std::vector<term_t> top_cut_tokens(const term_t* indices, const uint8_t* codes,
                                    size_t len, int cut, size_t element_size) {
     if (element_size == U32) {
@@ -197,9 +204,10 @@ pair_of_score_id_vector_t block_budget_query(
         }
     }
 
-    // Select the global top-k_prime blocks by summary score. The order among
-    // them does not affect the result (dedup + exact scoring are
-    // order-independent).
+    // Select the global top-k_prime blocks by summary score. Their order only
+    // matters on a truncated index: visited keeps the first copy of a doc the
+    // scan meets, so it decides whether the doc enters the pool with its exact
+    // score or a lower bound. Without truncation every copy is the same.
     const size_t budget =
         std::min(static_cast<size_t>(k_prime), candidates.size());
     if (budget < candidates.size()) {
@@ -218,8 +226,25 @@ pair_of_score_id_vector_t block_budget_query(
     // it cannot pull in a doc the block scores ranked out, but it still replaces
     // k lower bounds with k exact scores. Skipping it would hand back the lower
     // bounds as if they were scores.
-    const bool two_phase = rescore != nullptr && rescore->depth >= k;
-    TopKHolder<idx_t> holder(two_phase ? std::max(rescore->depth, k) : k);
+    const bool two_phase = rescore != nullptr;
+    size_t pool_depth = static_cast<size_t>(k);
+    if (two_phase) {
+        // The pool can never hold more docs than the selected blocks do, so a
+        // depth past that (INT32_MAX meaning "all") must not size the heap's
+        // reserve. The directory is in RAM, so this is O(k').
+        size_t pool_bound = 0;
+        for (const BlockCandidate& candidate : candidates) {
+            const InlineDirEntry* entry =
+                fwd == nullptr ? nullptr
+                               : fwd->dir_entry(candidate.pl, candidate.cid);
+            pool_bound += entry == nullptr ? 0 : entry->n_docs;
+        }
+        pool_depth =
+            std::max(pool_depth,
+                     std::min(static_cast<size_t>(std::max(rescore->depth, 0)),
+                              pool_bound));
+    }
+    TopKHolder<idx_t> holder(static_cast<int>(pool_depth));
     for (const BlockCandidate& candidate : candidates) {
         score_block(fwd, vectors, clusters, candidate.pl, candidate.cid, dense,
                     element_size, id_selector, holder, visited);

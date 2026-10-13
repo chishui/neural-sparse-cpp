@@ -60,6 +60,7 @@ set(NSPARSE_HEADERS
     utils/distance_sve.h
     utils/distance_simd.h
     utils/ranker.h
+    utils/omp_exception.h
     cluster/random_kmeans.h
     cluster/inverted_list_clusters.h
     cluster/kmeans_utils.h

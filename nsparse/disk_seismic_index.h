@@ -30,26 +30,30 @@ inline constexpr int kDefaultBlockBudget = 50;
 //
 // This is the recall/latency knob, and it is not free: reaching a whole copy is
 // a scattered read, so each extra candidate costs far more than its dot product
-// (benchmarks/DISK_SEISMIC_BENCH.md has the curve). 200 is the smallest depth at
-// which recall@10 over MS MARCO comes back within the noise a k-means seed
-// already causes, measured at inline_max_nnz=48; raising it buys hundredths of a
-// point for a third more latency, and at the candidate-pool size it is simply
-// the unpruned search. Lower it to trade recall for speed.
-inline constexpr int kDefaultRescoreDepth = 200;
+// (benchmarks/DISK_SEISMIC_BENCH.md has the curve). The depth a query needs
+// grows with k and with the candidate pool (k', cut), so the default is
+// relative to k: kAutoRescoreDepth resolves to
+// max(kAutoRescoreMinDepth, kAutoRescorePerK * k). The constants were tuned on
+// MS MARCO at inline_max_nnz=48, lambda=6000, cut=3, k'=50: 200 is where
+// recall@10 comes back within k-means seed noise, and 3-5 k is where k=100/200
+// does. A wider pool (larger k') with a smaller depth can match recall for less
+// latency, so tune the two together.
+inline constexpr int kAutoRescoreDepth = 0;
+inline constexpr int kAutoRescoreMinDepth = 200;
+inline constexpr int kAutoRescorePerK = 3;
 
 // `cut` (inherited) bounds which posting lists' summaries are scored; `k_prime`
 // caps how many blocks are read (the k_prime highest-scoring ones). Replaces
 // the inherited heap_factor, which the disk-resident indexes ignore. `rescore`
-// matters only for an index built with inline_max_nnz > 0: values below k are
-// raised to k, and a negative one is rejected at search time.
+// matters only for an index built with inline_max_nnz > 0: kAutoRescoreDepth
+// (0) picks a depth from k, a positive value below k is raised to k, and a
+// negative one is rejected.
 struct DiskSeismicSearchParameters : public SeismicSearchParameters {
     int k_prime = kDefaultBlockBudget;
-    int rescore = kDefaultRescoreDepth;
+    int rescore = kAutoRescoreDepth;
     DiskSeismicSearchParameters() = default;
-    DiskSeismicSearchParameters(int cut, int k_prime)
-        : SeismicSearchParameters(cut, /*heap_factor=*/1.0F),
-          k_prime(k_prime) {}
-    DiskSeismicSearchParameters(int cut, int k_prime, int rescore)
+    DiskSeismicSearchParameters(int cut, int k_prime,
+                                int rescore = kAutoRescoreDepth)
         : SeismicSearchParameters(cut, /*heap_factor=*/1.0F),
           k_prime(k_prime),
           rescore(rescore) {}

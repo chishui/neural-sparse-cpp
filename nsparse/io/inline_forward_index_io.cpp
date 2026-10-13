@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -35,12 +36,15 @@ namespace nsparse::detail {
 namespace {
 
 // One stored code, widened. Exact for the 1- and 2-byte code widths and for
-// float, so comparing widened values orders them exactly as the stored ones.
+// float, so comparing widened values orders them exactly as the stored ones. A
+// NaN weight reads as -inf: the selection needs a strict weak order, and a NaN
+// is the first thing a truncated copy should drop.
 double code_value(const uint8_t* values, size_t index, size_t element_size) {
     if (element_size == sizeof(float)) {
         float value = NAN;
         std::memcpy(&value, values + index * sizeof(float), sizeof(float));
-        return value;
+        return std::isnan(value) ? -std::numeric_limits<double>::infinity()
+                                 : value;
     }
     if (element_size == sizeof(uint16_t)) {
         uint16_t value = 0;
@@ -145,12 +149,9 @@ void resolve_docs(const FullVectorStore& store, const idx_t* doc_ids,
                     resolve_doc(store, doc_ids[begin + i], element_size));
                 continue;
             }
-            const InlineDirEntry& entry = *scratch->entries[i];
-            if (scratch->locators[i].slot >= entry.n_docs) {
-                throw std::runtime_error(
-                    "DiskSeismic: doc locator does not resolve to its doc");
-            }
-            out->push_back(store.fwd->doc_slice(entry, scratch->locators[i].slot));
+            out->push_back(store.fwd->doc_slice(
+                *scratch->entries[i], scratch->locators[i].slot,
+                static_cast<uint32_t>(doc_ids[begin + i])));
         }
     }
 }
@@ -178,7 +179,7 @@ InlineForwardIndex::CodeCut InlineForwardIndex::select_top_codes(
     // there counts the whole array.
     uint32_t above = 0;
     for (uint64_t i = 0; i < keep; ++i) {
-        above += (*scratch)[i] > cut ? 1 : 0;
+        above += (*scratch)[i] > cut ? 1U : 0U;
     }
     return {cut, static_cast<uint32_t>(keep) - above, false};
 }
@@ -325,6 +326,7 @@ InlineForwardIndex::BlockCounts InlineForwardIndex::count_block(
     }
     const uint32_t n_docs = static_cast<uint32_t>(docs.size());
     uint64_t total_nnz = 0;
+    bool truncates = false;
     for (const idx_t doc_id : docs) {
         if (doc_id < 0 || static_cast<size_t>(doc_id) >= num_vectors) {
             throw std::out_of_range(
@@ -332,10 +334,11 @@ InlineForwardIndex::BlockCounts InlineForwardIndex::count_block(
                 std::to_string(doc_id) + " outside [0, " +
                 std::to_string(num_vectors) + ")");
         }
-        total_nnz += doc_stored_nnz(
-            doc_id,
-            static_cast<uint64_t>(indptr[doc_id + 1] - indptr[doc_id]), pl,
-            block);
+        const auto full_nnz =
+            static_cast<uint64_t>(indptr[doc_id + 1] - indptr[doc_id]);
+        const uint64_t stored = doc_stored_nnz(doc_id, full_nnz, pl, block);
+        truncates = truncates || stored != full_nnz;
+        total_nnz += stored;
         // Capped at INT32_MAX (not the u32 max): off[] is uint32_t on the wire
         // but must stay reinterpretable as idx_t (int32_t) on the search path,
         // and a wrapped offset would also desync the block from its length.
@@ -344,10 +347,10 @@ InlineForwardIndex::BlockCounts InlineForwardIndex::count_block(
                 "InlineForwardIndex: block total nnz exceeds INT32_MAX");
         }
     }
-    return {n_docs, total_nnz};
+    return {n_docs, total_nnz, truncates};
 }
 
-uint64_t InlineForwardIndex::section_length() const {
+InlineForwardIndex::SectionSize InlineForwardIndex::section_size() const {
     const std::vector<InvertedListClusters>& lists = *lists_;
     const SparseVectors& vectors = *vectors_;
     const size_t element_size = vectors.get_element_size();
@@ -369,6 +372,7 @@ uint64_t InlineForwardIndex::section_length() const {
     // inline_block_offsets/inline_align_up), touching no payload. serialize()
     // asserts the streamed body matches this length, so any drift fails closed.
     uint64_t cur_off = inline_align_up(sizeof(InlineForwardIndexHeader), align);
+    bool truncates = false;
     for (size_t pl = 0; pl < lists.size(); ++pl) {
         const InvertedListClusters& list = lists[pl];
         const size_t n_clusters = list.cluster_size();
@@ -376,6 +380,7 @@ uint64_t InlineForwardIndex::section_length() const {
             const BlockCounts counts = count_block(
                 list.get_docs(block), indptr, num_vectors,
                 static_cast<uint32_t>(pl), static_cast<uint32_t>(block));
+            truncates = truncates || counts.truncates;
             cur_off += inline_block_offsets(counts.n_docs, counts.total_nnz,
                                             element_size)
                            .end;
@@ -383,8 +388,9 @@ uint64_t InlineForwardIndex::section_length() const {
         }
     }
     const uint64_t dir_offset = cur_off;
-    return dir_offset + n_blocks * sizeof(InlineDirEntry) +
-           sizeof(InlineForwardIndexTrailer);
+    return {.length = dir_offset + n_blocks * sizeof(InlineDirEntry) +
+                      sizeof(InlineForwardIndexTrailer),
+            .truncates = truncates};
 }
 
 void InlineForwardIndex::serialize(IOWriter* writer) const {
@@ -400,10 +406,13 @@ void InlineForwardIndex::serialize(IOWriter* writer) const {
     // comes from a payload-free sizing pass, so the (corpus-sized) body streams
     // straight to the writer rather than being buffered in RAM first.
     io_align::pad_to(writer, kMinBlockAlign);
-    uint64_t section_len = section_length();
+    const SectionSize size = section_size();
+    uint64_t section_len = size.length;
     writer->write(&section_len, sizeof(section_len), 1);
     const size_t body_start = writer->pos();
-    write_body(writer);
+    // A limit no copy reached (T >= every multi-copy doc's nnz) writes the same
+    // blocks as no limit, so record 0 and spare every query the second pass.
+    write_body(writer, size.truncates ? write_max_doc_nnz_ : 0);
     // The prefix must equal what the body actually wrote, or a reader would
     // trust a wrong length. Catches any sizing/emitting drift at the source.
     if (writer->pos() - body_start != section_len) {
@@ -413,7 +422,8 @@ void InlineForwardIndex::serialize(IOWriter* writer) const {
     }
 }
 
-void InlineForwardIndex::write_body(IOWriter* writer) const {
+void InlineForwardIndex::write_body(IOWriter* writer,
+                                    uint32_t max_doc_nnz) const {
     static_assert(sizeof(term_t) == kInlineCompWidth,
                   "component id width must match the inline format");
 
@@ -440,7 +450,7 @@ void InlineForwardIndex::write_body(IOWriter* writer) const {
 
     InlineForwardIndexHeader header{};
     header.element_size = static_cast<uint32_t>(element_size);
-    header.max_doc_nnz = write_max_doc_nnz_;
+    header.max_doc_nnz = max_doc_nnz;
     header.n_blocks = n_blocks;
     header.page_size = align;
     writer->write(&header, sizeof(header), 1);
@@ -472,7 +482,7 @@ void InlineForwardIndex::write_body(IOWriter* writer) const {
         for (size_t block = 0; block < n_clusters; ++block) {
             const std::span<const idx_t> docs = list.get_docs(block);
             const uint64_t block_off = cur_off;
-            // Validate + count once (the same call section_length() used), then
+            // Validate + count once (the same call section_size() used), then
             // build doc_id[]/off[] (the within-block CSR prefix sum) from the
             // now-safe docs. count_block keeps off[] within INT32_MAX, so the
             // running total below cannot wrap or desync the recorded length.
@@ -795,7 +805,7 @@ const InlineDirEntry* InlineForwardIndex::dir_entry(uint32_t pl,
 }
 
 DocSlice InlineForwardIndex::doc_slice(const InlineDirEntry& entry,
-                                      uint32_t slot) const {
+                                       uint32_t slot, uint32_t doc_id) const {
     if (slot >= entry.n_docs) {
         throw std::runtime_error("InlineForwardIndex: slot outside its block");
     }
@@ -807,6 +817,14 @@ DocSlice InlineForwardIndex::doc_slice(const InlineDirEntry& entry,
     if (hdr.comps > entry.len) {
         throw std::runtime_error(
             "InlineForwardIndex: block header overruns block");
+    }
+    // The locator table is the only record of where a doc's whole copy is, so
+    // check it names this doc; otherwise a corrupt locator would score another
+    // doc's vector under this id.
+    const auto* doc_ids = reinterpret_cast<const uint32_t*>(base + hdr.doc_ids);
+    if (doc_ids[slot] != doc_id) {
+        throw std::runtime_error(
+            "DiskSeismic: doc locator does not resolve to its doc");
     }
     const auto* offsets = reinterpret_cast<const uint32_t*>(base + hdr.off);
     const uint64_t total_nnz = offsets[entry.n_docs];

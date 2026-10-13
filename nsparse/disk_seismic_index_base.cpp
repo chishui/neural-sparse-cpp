@@ -32,9 +32,10 @@
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
-#include "nsparse/utils/ranker.h"
 #include "nsparse/utils/mmap_cursor.h"
 #include "nsparse/utils/mmap_file.h"
+#include "nsparse/utils/omp_exception.h"
+#include "nsparse/utils/ranker.h"
 
 namespace nsparse {
 
@@ -77,6 +78,26 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
                                   const term_t* indices, const float* values,
                                   int k, SearchParameters* search_parameters)
     -> pair_of_score_id_vectors_t {
+    // Validated before any early return, so a bad value fails the same way on
+    // every query and every index -- empty, exact-match, or truncated or not.
+    const detail::DiskSeismicCutBudget budget =
+        detail::resolve_cut_and_budget(search_parameters);
+    const int cut = budget.cut;
+    const int k_prime = budget.k_prime;
+    // k_prime is a block budget, not a document count: a block holds many docs,
+    // so k_prime < k is valid (a few blocks can still fill k, and a short-fall
+    // is padded like any under-budget search). Only a non-positive budget is
+    // rejected.
+    if (k_prime <= 0) {
+        throw std::invalid_argument(
+            "DiskSeismic index: k_prime (block budget) must be positive");
+    }
+    if (budget.rescore < 0) {
+        throw std::invalid_argument(
+            "DiskSeismic index: rescore (re-scoring depth) must be "
+            "non-negative");
+    }
+
     // Quit early when there is nothing to score: no vectors, no queries, or no
     // forward-vector source (fwd_ empty and vectors_ null — a corrupt or
     // uninitialized index).
@@ -130,26 +151,6 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
         }
     }
 
-    const detail::DiskSeismicCutBudget budget =
-        detail::resolve_cut_and_budget(search_parameters);
-    const int cut = budget.cut;
-    const int k_prime = budget.k_prime;
-    // k_prime is a block budget, not a document count: a block holds many docs,
-    // so k_prime < k is valid (a few blocks can still fill k, and a short-fall
-    // is padded like any under-budget search). Only a non-positive budget is
-    // rejected.
-    if (k_prime <= 0) {
-        throw std::invalid_argument(
-            "DiskSeismic index: k_prime (block budget) must be positive");
-    }
-    // Checked even when the index is not truncated and the depth is unused, so
-    // a bad value fails the same way whichever index it is pointed at.
-    if (budget.rescore < 0) {
-        throw std::invalid_argument(
-            "DiskSeismic index: rescore (re-scoring depth) must be "
-            "non-negative");
-    }
-
     // Encode the whole query batch once at the stored width; a query's codes
     // start at query_batch + start * element_size.
     const size_t element_size = code_element_size();
@@ -172,16 +173,16 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
     // 0) or for a fresh in-RAM build, whose vectors are the corpus itself.
     const bool rescore_needed =
         fwd != nullptr && fwd->max_doc_nnz() > 0 && doc_locators_ != nullptr;
-    // Re-scoring fewer than k candidates could not fill the result, so the depth
-    // is at least k; beyond the candidate pool it simply re-scores all of it.
     const detail::FullVectorStore store =
         rescore_needed ? full_vector_store() : detail::FullVectorStore{};
-    const int rescore_depth = rescore_needed ? std::max(budget.rescore, k) : 0;
+    const int rescore_depth =
+        rescore_needed ? detail::resolve_rescore_depth(budget.rescore, k) : 0;
     const IDSelector* id_selector = search_parameters == nullptr
                                         ? nullptr
                                         : search_parameters->get_id_selector();
     const size_t dense_bytes = static_cast<size_t>(dimension_) * element_size;
 
+    detail::OmpExceptionCapture errors;
 #pragma omp parallel
     {
         // Per-thread scratch reused across the queries a thread handles: the
@@ -194,29 +195,35 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
         std::vector<float> score_scratch;
         // Per-thread, so the batched whole-vector resolve reuses its buffers
         // across the queries this thread handles.
-        detail::RescorePass rescore{.store = store, .depth = rescore_depth};
+        detail::RescorePass rescore{.store = store,
+                                    .depth = rescore_depth,
+                                    .scratch = {},
+                                    .slices = {}};
 
 #pragma omp for schedule(dynamic, 64)
         for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
-            const offset_t start = indptr[query_idx];
-            const size_t len = indptr[query_idx + 1] - start;
-            const term_t* query_indices = indices + start;
-            const uint8_t* query_codes =
-                query_batch + static_cast<size_t>(start) * element_size;
-            const std::vector<term_t> cuts = detail::top_cut_tokens(
-                query_indices, query_codes, len, cut, element_size);
-            auto [scores, ids] = detail::block_budget_query(
-                dense.data(), element_size, visited, candidates, score_scratch,
-                query_indices, query_codes, len, cuts, k, k_prime,
-                clustered_inverted_lists, fwd, vectors, id_selector,
-                rescore_needed ? &rescore : nullptr);
-            decode_scores(scores, search_parameters);
-            scores.resize(k, -1.0F);
-            ids.resize(k, detail::INVALID_IDX);
-            result_distances[query_idx] = std::move(scores);
-            result_labels[query_idx] = std::move(ids);
+            errors.run([&] {
+                const offset_t start = indptr[query_idx];
+                const size_t len = indptr[query_idx + 1] - start;
+                const term_t* query_indices = indices + start;
+                const uint8_t* query_codes =
+                    query_batch + static_cast<size_t>(start) * element_size;
+                const std::vector<term_t> cuts = detail::top_cut_tokens(
+                    query_indices, query_codes, len, cut, element_size);
+                auto [scores, ids] = detail::block_budget_query(
+                    dense.data(), element_size, visited, candidates,
+                    score_scratch, query_indices, query_codes, len, cuts, k,
+                    k_prime, clustered_inverted_lists, fwd, vectors,
+                    id_selector, rescore_needed ? &rescore : nullptr);
+                decode_scores(scores, search_parameters);
+                scores.resize(k, -1.0F);
+                ids.resize(k, detail::INVALID_IDX);
+                result_distances[query_idx] = std::move(scores);
+                result_labels[query_idx] = std::move(ids);
+            });
         }
     }
+    errors.rethrow();
     return {result_distances, result_labels};
 }
 
@@ -337,7 +344,8 @@ void DiskSeismicIndexBase::read_index(IOReader* /*io_reader*/,
 }
 
 void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
-                                               MmapFile&& mapped) {
+                                               MmapFile&& mapped,
+                                               uint32_t format_version) {
     // Same order write_index wrote them (past any extra header the caller
     // already consumed): doc count, summaries, inline forward.
     num_vectors_ = cursor->read_scalar<uint64_t>();
@@ -345,6 +353,9 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     inv_list_writer.mmap_deserialize(cursor);
     detail::InlineForwardIndex forward;
     forward.mmap_deserialize(cursor);
+    if (format_version < 2) {
+        forward.ignore_max_doc_nnz();
+    }
 
     clustered_inverted_lists = std::move(inv_list_writer.release());
     fwd_ = std::move(forward);
@@ -361,6 +372,7 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     doc_locators_ = cursor->read_array<detail::DocLocator>(num_locators);
     num_locators_ = num_locators;
     remainder_.mmap_deserialize(cursor);
+    validate_doc_locators();
 
     // Now that the summaries and forward index are populated (still borrowing
     // from `mapped`, which is alive here), let the concrete index reject a
@@ -370,6 +382,28 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     // index_mapping_ last: the summaries and the forward index borrow from it,
     // and moving it does not move the mapping.
     index_mapping_ = std::move(mapped);
+}
+
+void DiskSeismicIndexBase::validate_doc_locators() const {
+    // Directory-only: confirming each slot holds its doc would read every
+    // block, so resolve_doc / doc_slice check that per resolve instead.
+    const size_t remainder_rows = remainder_.num_vectors();
+    for (uint64_t doc_id = 0; doc_id < num_locators_; ++doc_id) {
+        const detail::DocLocator& locator = doc_locators_[doc_id];
+        if (locator.posting_list == detail::DocLocator::kRemainder) {
+            if (locator.block >= remainder_rows) {
+                throw std::runtime_error(
+                    "DiskSeismic index: remainder locator out of range");
+            }
+            continue;
+        }
+        const detail::InlineDirEntry* entry =
+            fwd_.dir_entry(locator.posting_list, locator.block);
+        if (entry == nullptr || locator.slot >= entry->n_docs) {
+            throw std::runtime_error(
+                "DiskSeismic index: doc locator outside its block");
+        }
+    }
 }
 
 auto DiskSeismicIndexBase::full_vector_store() const
@@ -398,58 +432,63 @@ auto DiskSeismicIndexBase::exact_match_directory(
     const size_t dense_bytes =
         static_cast<size_t>(get_dimension()) * element_size;
 
+    detail::OmpExceptionCapture errors;
 #pragma omp parallel
     {
         // Per-thread dense query buffer, cleared per query below.
         std::vector<uint8_t> dense(dense_bytes, 0);
 #pragma omp for schedule(dynamic, 64)
         for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
-            const offset_t start = indptr[query_idx];
-            const size_t len =
-                static_cast<size_t>(indptr[query_idx + 1] - start);
-            const term_t* q_indices = indices + start;
-            const uint8_t* q_codes =
-                query_codes + static_cast<size_t>(start) * element_size;
-            for (size_t i = 0; i < len; ++i) {
-                std::copy_n(
-                    q_codes + i * element_size, element_size,
-                    dense.data() +
-                        static_cast<size_t>(q_indices[i]) * element_size);
-            }
-
-            detail::TopKHolder<idx_t> holder(k);
-            for (const idx_t doc_id : ids) {
-                if (doc_id < 0 ||
-                    static_cast<uint64_t>(doc_id) >= num_locators_) {
-                    continue;  // out-of-range member: nothing to score
+            errors.run([&] {
+                const offset_t start = indptr[query_idx];
+                const size_t len =
+                    static_cast<size_t>(indptr[query_idx + 1] - start);
+                const term_t* q_indices = indices + start;
+                const uint8_t* q_codes =
+                    query_codes + static_cast<size_t>(start) * element_size;
+                for (size_t i = 0; i < len; ++i) {
+                    std::copy_n(
+                        q_codes + i * element_size, element_size,
+                        dense.data() +
+                            static_cast<size_t>(q_indices[i]) * element_size);
                 }
-                const detail::DocSlice doc =
-                    detail::resolve_doc(store, doc_id, element_size);
-                // Dot the doc's slice against the dense query via a 2-entry
-                // indptr.
-                const offset_t slice_indptr[2] = {
-                    0, static_cast<offset_t>(doc.nnz)};
-                const float score = detail::compute_similarity(
-                    0, slice_indptr, doc.comps, doc.vals, dense.data(),
-                    element_size);
-                holder.add(score, doc_id);
-            }
 
-            // Decode before padding so the -1 pad is not decoded.
-            auto [scores, labels] = holder.top_k_items_descending();
-            decode_scores(scores, search_parameters);
-            scores.resize(k, -1.0F);
-            labels.resize(k, detail::INVALID_IDX);
+                detail::TopKHolder<idx_t> holder(k);
+                for (const idx_t doc_id : ids) {
+                    if (doc_id < 0 ||
+                        static_cast<uint64_t>(doc_id) >= num_locators_) {
+                        continue;  // out-of-range member: nothing to score
+                    }
+                    const detail::DocSlice doc =
+                        detail::resolve_doc(store, doc_id, element_size);
+                    // Dot the doc's slice against the dense query via a 2-entry
+                    // indptr.
+                    const offset_t slice_indptr[2] = {
+                        0, static_cast<offset_t>(doc.nnz)};
+                    const float score = detail::compute_similarity(
+                        0, slice_indptr, doc.comps, doc.vals, dense.data(),
+                        element_size);
+                    holder.add(score, doc_id);
+                }
 
-            for (size_t i = 0; i < len; ++i) {
-                std::fill_n(dense.data() + static_cast<size_t>(q_indices[i]) *
-                                               element_size,
-                            element_size, uint8_t{0});
-            }
-            result_distances[query_idx] = std::move(scores);
-            result_labels[query_idx] = std::move(labels);
+                // Decode before padding so the -1 pad is not decoded.
+                auto [scores, labels] = holder.top_k_items_descending();
+                decode_scores(scores, search_parameters);
+                scores.resize(k, -1.0F);
+                labels.resize(k, detail::INVALID_IDX);
+
+                for (size_t i = 0; i < len; ++i) {
+                    std::fill_n(
+                        dense.data() +
+                            static_cast<size_t>(q_indices[i]) * element_size,
+                        element_size, uint8_t{0});
+                }
+                result_distances[query_idx] = std::move(scores);
+                result_labels[query_idx] = std::move(labels);
+            });
         }
     }
+    errors.rethrow();
     return {result_distances, result_labels};
 }
 

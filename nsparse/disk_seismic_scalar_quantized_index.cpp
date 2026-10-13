@@ -155,7 +155,7 @@ DiskSeismicScalarQuantizedIndex* DiskSeismicScalarQuantizedIndex::mmap_index(
     const auto vmax = cursor.read_scalar<float>();
     index->sq_ = make_scalar_quantizer(sq_type, vmin, vmax);
 
-    index->load_mapped_payload(&cursor, std::move(mmap_file));
+    index->load_mapped_payload(&cursor, std::move(mmap_file), header.version);
     return index.release();
 }
 }  // namespace nsparse

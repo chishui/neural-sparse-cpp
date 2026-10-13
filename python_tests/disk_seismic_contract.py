@@ -224,9 +224,10 @@ class DiskSeismicContract:
     # --- inline_max_nnz (build) and rescore (query) ---
 
     def test_rescore_defaults_to_the_library_depth(self):
-        """rescore is a plain per-query field: defaulted, overridable at
-        construction, and settable afterwards."""
-        assert self.params().rescore == nsparse.kDefaultRescoreDepth
+        """rescore is a plain per-query field: defaulted (to the automatic,
+        k-relative depth), overridable at construction, and settable
+        afterwards."""
+        assert self.params().rescore == nsparse.kAutoRescoreDepth
         p = self.params(rescore=7)
         assert p.rescore == 7
         p.rescore = 11
@@ -256,6 +257,20 @@ class DiskSeismicContract:
             search(cut, queries, params=everything),
             search(whole, queries, params=self.params(k_prime=10**6)),
         )
+
+    def test_rescore_below_the_pool_still_ranks_well(
+        self, corpus, queries, oracle, tmp_path
+    ):
+        """A depth below the candidate pool is where the block scores decide
+        what gets re-scored: recall must hold up there, and the result must
+        differ from re-scoring everything, or the fixture no longer exercises
+        the first pass at all."""
+        cut = self.truncated(corpus, tmp_path / "cut.idx")
+        _, partial = search(cut, queries, params=self.params(rescore=100))
+        _, everything = search(cut, queries, params=self.params(rescore=10**6))
+        want_labels, _ = oracle
+        assert recall_at_k(partial, want_labels) >= 0.80
+        assert not np.array_equal(partial, everything)
 
     def test_truncated_index_clears_the_recall_floor(
         self, corpus, queries, oracle, tmp_path
@@ -295,7 +310,7 @@ class DiskSeismicContract:
                         f"query {q} doc {doc} returned a lower bound"
                     )
 
-    @pytest.mark.parametrize("below", [0, 1, K - 1])
+    @pytest.mark.parametrize("below", [1, K - 1])
     def test_rescore_below_k_behaves_like_k(self, below, corpus, queries, tmp_path):
         """Fewer than k re-scored candidates could not fill the result, so the
         depth is raised to k."""
@@ -325,7 +340,9 @@ class DiskSeismicContract:
         with pytest.raises(ValueError, match="non-negative"):
             search(index, queries, params=self.params(rescore=-1))
 
-    @pytest.mark.parametrize("bad", ["-1", "4294967296", "abc"])
+    @pytest.mark.parametrize(
+        "bad", ["-1", "4294967296", "abc", "", "1e3", "0x40", "64abc", "64.9"]
+    )
     def test_factory_rejects_a_bad_inline_max_nnz(self, corpus, bad):
         """A malformed limit fails the spec instead of becoming "no truncation"."""
         with pytest.raises(ValueError):
@@ -333,12 +350,21 @@ class DiskSeismicContract:
 
     def test_truncated_with_id_map(self, corpus, queries, doc_ids, tmp_path):
         """idmap forwards the search parameters, rescore included, to a
-        truncated delegate and maps the re-scored ids back."""
+        truncated delegate and maps the re-scored ids back: it returns exactly
+        what the delegate does at the same depth, translated to caller ids."""
         spec = f"idmap,{self.SEEDED}|inline_max_nnz={self.INLINE_MAX_NNZ}"
         index = roundtrip(
             make_index(spec, corpus, ids=doc_ids), tmp_path / "idmap.idx", nsparse.kUseMmap
         )
-        _, labels = search(index, queries, params=self.params(rescore=50))
-        returned = labels[labels >= 0]
-        assert returned.size > 0
-        assert np.isin(returned, doc_ids).all(), "returned ids must be caller ids"
+        delegate = self.truncated(corpus, tmp_path / "delegate.idx")
+        ids = np.asarray(doc_ids)
+        results = []
+        for depth in [10, 50]:
+            params = self.params(rescore=depth)
+            _, labels = search(index, queries, params=params)
+            _, internal = search(delegate, queries, params=params)
+            want = np.where(internal >= 0, ids[np.maximum(internal, 0)], internal)
+            np.testing.assert_array_equal(labels, want)
+            results.append(labels)
+        # The two depths must disagree somewhere, or dropping rescore would pass.
+        assert not np.array_equal(results[0], results[1])

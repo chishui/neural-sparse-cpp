@@ -20,8 +20,8 @@ namespace nsparse::detail {
 /**
  * On-disk "inline" (block-contiguous) forward-index format: each doc's vector
  * is copied into every block (cluster) it belongs to, so a block is one
- * contiguous mmap read. Single file, host byte order, rebuildable (no
- * cross-version guarantee):
+ * contiguous mmap read. Single file, host byte order, versioned by the
+ * enclosing disk index's kFormatVersion (a current reader still loads v1):
  *   [InlineForwardIndexHeader]  (padded to page_size when page-aligned)
  *   per block (structure-of-arrays, a within-block CSR):
  *       [u32 n_docs]
@@ -39,15 +39,16 @@ namespace nsparse::detail {
  * offset, capped at INT32_MAX by the writer so it converts to idx_t losslessly.
  * Component: io/inline_forward_index_io.h.
  *
- * A doc's vector is duplicated into every block that holds it -- about 13 copies
- * at the standard parameters -- which is what makes a block one contiguous read
- * and also what makes the section the bulk of the file. The header's
- * `max_doc_nnz` bounds the *extra* copies: when it is non-zero, one copy of each
- * doc stays whole and every other copy keeps only its largest max_doc_nnz
- * components. Blocks are then cheaper to score but their scores are lower bounds,
- * so a reader that sees max_doc_nnz != 0 must re-score its best candidates
- * against the whole copies (DocLocator finds them) before trusting the ranking.
- * max_doc_nnz == 0 means every copy is whole and no re-scoring is needed.
+ * A doc's vector is duplicated into every block that holds it -- about 13
+ * copies at the standard parameters -- which is what makes a block one
+ * contiguous read and also what makes the section the bulk of the file. The
+ * header's `max_doc_nnz` bounds the *extra* copies: when it is non-zero, one
+ * copy of each doc stays whole and every other copy keeps only its largest
+ * max_doc_nnz components. Blocks are then cheaper to score but their scores are
+ * lower bounds, so a reader that sees max_doc_nnz != 0 must re-score its best
+ * candidates against the whole copies (DocLocator finds them) before trusting
+ * the ranking. max_doc_nnz == 0 means every copy is whole and no re-scoring is
+ * needed.
  */
 
 // Locates the one copy of a doc's vector that is never truncated. When
@@ -90,10 +91,11 @@ inline constexpr uint64_t kMinBlockAlign = 8;
 // to kMinBlockAlign when packed).
 struct InlineForwardIndexHeader {
     uint32_t element_size;  // 1, 2, or 4
-    // Components kept by a doc's truncated copies; 0 = every copy is whole.
-    // Sits in what was padding after element_size, so the header keeps its size
-    // and a file written before this field existed reads back as 0 (the writer
-    // value-initializes the header, so those bytes were already zero).
+    // Components kept by a doc's truncated copies; 0 = every copy is whole,
+    // including when the limit was set but no copy exceeded it. Sits in what
+    // was padding after element_size, so the header keeps its size; those bytes
+    // are not guaranteed zero in a file written before this field existed, so
+    // a reader of a format-version-1 index ignores them.
     uint32_t max_doc_nnz;
     uint64_t n_blocks;
     uint64_t page_size;  // effective block alignment (>= kMinBlockAlign)

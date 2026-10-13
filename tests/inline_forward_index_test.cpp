@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -998,7 +999,72 @@ TEST(InlineForwardIndex, ResolveRejectsALocatorPastItsBlock) {
 
     const nsparse::detail::InlineDirEntry* entry = index.dir_entry(0, 0);
     ASSERT_NE(entry, nullptr);
-    EXPECT_THROW(index.doc_slice(*entry, entry->n_docs), std::runtime_error);
+    EXPECT_THROW(index.doc_slice(*entry, entry->n_docs, 0), std::runtime_error);
     EXPECT_EQ(index.dir_entry(0, 99), nullptr);
     EXPECT_EQ(index.dir_entry(99, 0), nullptr);
+}
+
+// A locator naming another doc's valid slot is just as corrupt: both resolve
+// paths must refuse it rather than re-score that doc's vector under this id.
+TEST(InlineForwardIndex, ResolveRejectsALocatorNamingAnotherDoc) {
+    TruncatedFixture fx;
+    auto index = read_index(fx.bin);
+    std::vector<nsparse::detail::DocLocator> corrupt = fx.locators;
+    // Docs 0 and 5 share list 0's block 0; point doc 5 at doc 0's slot.
+    ASSERT_EQ(corrupt[5].posting_list, corrupt[0].posting_list);
+    ASSERT_EQ(corrupt[5].block, corrupt[0].block);
+    corrupt[5].slot = corrupt[0].slot;
+    const nsparse::detail::FullVectorStore store{.fwd = &index,
+                                                 .locators = corrupt.data(),
+                                                 .num_locators = corrupt.size(),
+                                                 .remainder = nullptr};
+    EXPECT_THROW(nsparse::detail::resolve_doc(store, 5, nsparse::U32),
+                 std::runtime_error);
+    const std::vector<nsparse::idx_t> ids = {0, 5};
+    nsparse::detail::DocResolveScratch scratch;
+    std::vector<nsparse::detail::DocSlice> slices;
+    EXPECT_THROW(nsparse::detail::resolve_docs(store, ids.data(), ids.size(),
+                                               nsparse::U32, &scratch, &slices),
+                 std::runtime_error);
+}
+
+// A NaN weight must not break the selection's ordering: the truncating write
+// still produces a loadable section, and the NaN is the component it drops.
+TEST(InlineForwardIndex, TruncationDropsANaNWeightFirst) {
+    constexpr uint32_t kKeep = 3;
+    auto vectors = create_float_vectors({{0, 1, 2, 3, 4}},
+                                        {{0.4F, NAN, 0.2F, 0.9F, 0.1F}}, 10);
+    auto lists = build_lists({{{0}}, {{0}}}, vectors);
+    const std::vector<nsparse::detail::DocLocator> full_copies = {{0, 0, 0}};
+    InlineForwardIndex writer(lists, vectors,
+                              InlineForwardIndex::kDefaultPageSize,
+                              InlineLayout::kPacked, kKeep, &full_copies);
+    nsparse::BufferedIOWriter buffer;
+    ASSERT_NO_THROW(writer.serialize(&buffer));
+    auto index = read_index(buffer.data());
+    const BlockView cut = index.block(1, 0);
+    ASSERT_FALSE(cut.absent());
+    ASSERT_EQ(cut.nnz(0), kKeep);
+    const std::vector<nsparse::term_t> kept(cut.doc_comps(0),
+                                            cut.doc_comps(0) + kKeep);
+    EXPECT_EQ(kept, (std::vector<nsparse::term_t>{0, 2, 3}));
+}
+
+// A limit no multi-copy doc exceeds cuts nothing, so the section must be the
+// untruncated one byte for byte -- max_doc_nnz 0 included, or every query would
+// pay a second pass that cannot change anything.
+TEST(InlineForwardIndex, ALimitNoCopyReachesWritesTheUntruncatedSection) {
+    TruncatedFixture fx;  // 6 components per doc
+    auto lists = build_lists(fx.layout, fx.vectors);
+    const auto whole =
+        serialize_bytes(lists, fx.vectors, InlineForwardIndex::kDefaultPageSize,
+                        InlineLayout::kPacked);
+    for (const uint32_t limit : {6U, 7U, UINT32_MAX}) {
+        InlineForwardIndex writer(lists, fx.vectors,
+                                  InlineForwardIndex::kDefaultPageSize,
+                                  InlineLayout::kPacked, limit, &fx.locators);
+        nsparse::BufferedIOWriter buffer;
+        writer.serialize(&buffer);
+        EXPECT_EQ(buffer.data(), whole) << "limit " << limit;
+    }
 }

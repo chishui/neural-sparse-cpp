@@ -9,11 +9,13 @@
 
 #include "nsparse/index_factory.h"
 
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "nsparse/brutal_index.h"
@@ -73,13 +75,17 @@ SeismicClusterParameters parse_cluster_params(const GetParam& get_param) {
 // (0 = keep every copy whole). See inline_forward_index.h.
 template <class GetParam>
 uint32_t parse_inline_max_nnz(const GetParam& get_param) {
-    // Parsed signed: std::stoul accepts "-1" and wraps it to ULONG_MAX, which
-    // would silently build an untruncated index from a typo.
+    // The whole token must be a decimal integer: std::stoll/stoul stop at the
+    // first non-digit ("1e3" -> 1, "0x40" -> 0) and stoul wraps "-1", each of
+    // which would silently build a different index than the one asked for.
     const std::string text = get_param("inline_max_nnz", "0");
-    const long long value = std::stoll(text);
-    if (value < 0 || value > static_cast<long long>(UINT32_MAX)) {
-        throw std::invalid_argument("inline_max_nnz must be in [0, 2^32), got " +
-                                    text);
+    uint64_t value = 0;
+    const char* end = text.data() + text.size();
+    const auto [ptr, ec] = std::from_chars(text.data(), end, value);
+    if (ec != std::errc{} || ptr != end || value > UINT32_MAX) {
+        throw std::invalid_argument(
+            "inline_max_nnz must be an integer in [0, 2^32), got '" + text +
+            "'");
     }
     return static_cast<uint32_t>(value);
 }

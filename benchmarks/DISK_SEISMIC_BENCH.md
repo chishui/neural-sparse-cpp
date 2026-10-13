@@ -157,13 +157,18 @@ index = nsparse.index_factory(dim, "disk_seismic_sq,quantizer=8bit|vmin=0|vmax=3
                                    "lambda=6000|beta=400|alpha=0.4|inline_max_nnz=64")
 # ... add, build, write_index, read_index(path, nsparse.kUseMmap) ...
 params = nsparse.DiskSeismicSQSearchParameters(0.0, 3.0, 3, 50, 100)  # vmin vmax cut k' rescore
-params.rescore = 200            # per query; default nsparse.kDefaultRescoreDepth (200)
+params.rescore = 200            # per query; default nsparse.kAutoRescoreDepth = max(200, 3·k)
 ```
 
-`inline_max_nnz` is fixed at build time and recorded in the file. `rescore` is ignored on an
-untruncated index, raised to k when smaller, and rejected when negative.
+`inline_max_nnz` is fixed at build time and recorded in the file (as 0 when no copy was long
+enough to cut). `rescore` is ignored on an untruncated index; the default, `kAutoRescoreDepth`
+(0), resolves to max(200, 3·k), because the depth a query needs grows with k; an explicit value
+is raised to k when smaller and capped at the pool the selected blocks hold; a negative one is
+rejected.
 
-Two points worth naming. **T=64 with rescore=100 is free**: 44.6% off the file at 0.98× the
+Two points worth naming, both at this table's operating point only (warm, k=10, cut=3, k'=50,
+λ=6000): at a larger k the depth has to grow with it, which is what the automatic default does.
+**T=64 with rescore=100 is free** here: 44.6% off the file at 0.98× the
 latency and a recall difference smaller than the ±0.1 pp a k-means seed causes on its own.
 **T=48 with rescore=200** buys another 9 points of file size for 1.15× latency, still at
 recall parity. Below T=48 recall starts to cost real ground, so T=32 is only worth it when disk
