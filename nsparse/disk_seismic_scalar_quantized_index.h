@@ -51,7 +51,8 @@ public:
     // Bump whenever write_index's payload layout changes. 2 added the
     // truncated inline forward index: a v2 file may hold partial copies that a
     // v1 reader would score as if whole. Reading v1 stays supported (nothing is
-    // truncated there), so only new files need the newer build.
+    // truncated there), and an untruncated index is still written as v1 (see
+    // written_format_version), so only truncated files need the newer build.
     static constexpr uint32_t kFormatVersion = 2;
 
     explicit DiskSeismicScalarQuantizedIndex(int dim);

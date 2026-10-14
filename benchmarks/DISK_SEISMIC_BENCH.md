@@ -183,13 +183,16 @@ through tables far past any cache. That is why `rescore` is the latency knob and
 one doc at a time: doing that took the per-doc cost from 0.68 µs to 0.45 µs (−34%) with
 bit-identical results at every depth.
 
-Two honest costs beyond latency:
+Two honest costs beyond latency, both from one cold run (caches dropped, all 6,980 queries) at
+T=48 with `rescore=300`. Both grow with the depth:
 
-- **Cold first pass** 0.897 → 1.153 Ms (+28.5%) at T=48. The file is half the size but the
-  second pass touches ~300 additional scattered blocks per query, which is 6× the 50 the scan
-  reads, so a cold run faults in more distinct pages even though there are fewer bytes overall.
-- **Resident set** 6.04 → 7.56 GiB (+25%) at T=48, `RssFile` 5.71 → 7.23, for the same reason.
-  The smaller file does *not* buy a smaller working set here; it buys disk.
+- **Cold first pass** 897 s → 1,153 s (+28.5%). The file is half the size, but the second pass
+  reads whole copies from blocks the scan did not select: ~142 distinct blocks per query beyond
+  the scan's 50 at `rescore=300` (~93 at 200), so a cold run faults in more distinct pages even
+  though there are fewer bytes overall.
+- **Resident set** 6.04 → 7.56 GiB (+25%), `RssFile` 5.71 → 7.23, for the same reason. At
+  `rescore=200`, the default at k=10, a page-exact replay gives `RssFile` 5.71 → 6.60 GiB
+  (+16%). The smaller file does *not* buy a smaller working set here; it buys disk.
 
 What did **not** work, so nobody repeats it:
 

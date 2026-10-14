@@ -43,6 +43,15 @@ public:
     // Persisted, since a mapped index has no in-RAM vectors_ to derive it from.
     size_t num_vectors() const override { return num_vectors_; }
 
+    // With nothing truncated the payload is the v1 layout byte for byte
+    // (max_doc_nnz stays 0, in bytes v1 left as padding), so it is stamped 1
+    // and builds that predate truncation still open it. Only while 2 is
+    // current: a later layout change must stamp its own version on every file.
+    [[nodiscard]] uint32_t written_format_version() const override {
+        return inline_max_nnz_ == 0 && format_version() == 2 ? 1
+                                                             : format_version();
+    }
+
     void add(idx_t n, const offset_t* indptr, const term_t* indices,
              const float* values) override;
     void build() override;
@@ -154,7 +163,8 @@ private:
     // no locator table (a fresh in-RAM build).
     [[nodiscard]] detail::FullVectorStore full_vector_store() const;
     // Rejects a locator that points outside the directory or the remainder
-    // store. Checked once at load, so search never meets one mid-query.
+    // store. Run at load on a truncated index, whose every query reads the
+    // table, so search never meets one mid-query.
     void validate_doc_locators() const;
     // Scores every selected doc directly through the doc-locator directory, for
     // a mapped index. Requires doc_locators_ populated.

@@ -589,7 +589,7 @@ Every serialized index starts with a fixed header (`nsparse::IndexHeader` in `ns
 
 The payload follows immediately, and its layout is the index type's own business. A type parses it in `read_index` (copying), `mmap_index` (borrowed from a file mapping), or both — `DiskSeismicIndex` is mmap-only and its `read_index` just throws, while `IDMapIndex` has no `mmap_index` at all and instead threads `io_flags` down to its delegate.
 
-Versions are numbered **per index type**, not per file: `IndexIO::format_version()` returns the type's own `kFormatVersion`, so revising one type's payload leaves the others' numbering alone. An `IDMapIndex` writes its own header for the id map and then a second, complete header for the delegate it wraps, each with its own version.
+Versions are numbered **per index type**, not per file: `IndexIO::format_version()` returns the type's own `kFormatVersion`, so revising one type's payload leaves the others' numbering alone. A file is stamped with `IndexIO::written_format_version()`, which defaults to the same; a type can stamp an older version when that file's payload is still the older layout, so older builds keep reading it (the disk SEISMIC types write 1 when nothing is truncated). An `IDMapIndex` writes its own header for the id map and then a second, complete header for the delegate it wraps, each with its own version.
 
 The same central code rejects a version outside `1..format_version()` before dispatching to either parse path — a file from a newer build fails with a clear error instead of consuming whatever its fields happen to align with.
 

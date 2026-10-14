@@ -90,6 +90,37 @@ public:
     const uint8_t* data() const { return data_; }
     size_t size() const { return size_; }
 
+    // Runs `read` with readahead on over [begin, begin + len), a range of this
+    // mapping, then puts the mapping's own hint back. For a one-off sweep
+    // through part of a MADV_RANDOM mapping, where each cold 4 KiB page would
+    // otherwise be its own synchronous read.
+    template <class Read>
+    void read_sequentially(const uint8_t* begin, size_t len, Read&& read) {
+        if (len > 0 && (begin < data_ ||
+                        len > size_ - static_cast<size_t>(begin - data_))) {
+            throw std::out_of_range("mmap: range outside the mapping");
+        }
+#if !defined(_WIN32)
+        if (len > 0 && !hugetlb_) {
+            const auto page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+            // madvise takes a page-aligned start.
+            const size_t lead = reinterpret_cast<uintptr_t>(begin) & (page - 1);
+            // Restored even if `read` throws: the mapping may outlive it.
+            struct Advice {
+                void* addr;
+                size_t len;
+                int restore;
+                ~Advice() { ::madvise(addr, len, restore); }
+            } advice{const_cast<uint8_t*>(begin - lead), len + lead,
+                     random_ ? MADV_RANDOM : MADV_NORMAL};
+            ::madvise(advice.addr, advice.len, MADV_SEQUENTIAL);
+            read();
+            return;
+        }
+#endif
+        read();
+    }
+
     void open(const std::string& path,
               AccessPattern access = AccessPattern::kScan) {
         close();
@@ -204,6 +235,7 @@ public:
         // "hugepage" | "random" | "normal" | "hugetlb".
         if (mode == "random") {
             ::madvise(addr, size_, MADV_RANDOM);
+            random_ = true;
         } else if (mode == "normal") {
             // leave kernel defaults
         } else {
@@ -234,6 +266,7 @@ public:
 #endif
         data_ = nullptr;
         size_ = 0;
+        random_ = false;
     }
 
 private:
@@ -241,9 +274,11 @@ private:
         data_ = other.data_;
         size_ = other.size_;
         hugetlb_ = other.hugetlb_;
+        random_ = other.random_;
         other.data_ = nullptr;
         other.size_ = 0;
         other.hugetlb_ = false;
+        other.random_ = false;
 #if defined(_WIN32)
         file_ = other.file_;
         mapping_ = other.mapping_;
@@ -255,6 +290,7 @@ private:
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
     bool hugetlb_ = false;  // data_ is an anonymous MAP_HUGETLB copy, not the file
+    bool random_ = false;   // mapped with MADV_RANDOM
 #if defined(_WIN32)
     HANDLE file_ = INVALID_HANDLE_VALUE;
     HANDLE mapping_ = nullptr;

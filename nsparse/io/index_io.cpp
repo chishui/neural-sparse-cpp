@@ -179,7 +179,7 @@ void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     }
     // write header
     write_header({.id = fourcc(index->id()),
-                  .version = index_io->format_version(),
+                  .version = index_io->written_format_version(),
                   .dimension = index->get_dimension()},
                  io_writer);
     // write index customized payload

@@ -83,6 +83,14 @@ public:
     // change ship without one, which is the failure the header exists to catch.
     [[nodiscard]] virtual uint32_t format_version() const = 0;
 
+    // The version write_index stamps on this file. format_version() is also
+    // the newest version read_index accepts, so a type whose payload is
+    // sometimes still an older layout can stamp that one instead and keep
+    // older builds reading those files.
+    [[nodiscard]] virtual uint32_t written_format_version() const {
+        return format_version();
+    }
+
     virtual void write_index(IOWriter* io_writer) {};
 
     // `header` is what the file declared, with its version already checked

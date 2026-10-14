@@ -14,6 +14,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <ios>
 #include <random>
 #include <set>
 #include <string>
@@ -132,6 +134,22 @@ private:
     std::filesystem::path path_{};
     std::string path_str_ = path_.string();
 };
+
+// The format version a file's IndexHeader records, right after its type id.
+inline uint32_t file_format_version(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(sizeof(uint32_t)));
+    uint32_t version = 0;
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    return version;
+}
+
+// Relabels a file in place, as if another version had written it.
+inline void set_file_format_version(const char* path, uint32_t version) {
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    out.seekp(static_cast<std::streamoff>(sizeof(uint32_t)));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+}
 
 using ScoreIds =
     std::pair<std::vector<std::vector<float>>, std::vector<std::vector<idx_t>>>;

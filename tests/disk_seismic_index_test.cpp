@@ -339,4 +339,58 @@ TEST(DiskSeismicIndex, TruncatedInlineMatchesWholeWhenEverythingIsRescored) {
     EXPECT_LT(cut_file.size(), whole_file.size());
 }
 
+// Builds, writes, and mmap-reloads a float index over `corpus` with
+// inline_max_nnz = `limit` (0 = every copy whole).
+std::unique_ptr<Index> mapped_dsei(const CSR& corpus, uint32_t limit,
+                                   TempIndexFile& file) {
+    DiskSeismicIndex index(kDim, cluster_params(), limit);
+    add_corpus(index, corpus);
+    index.build();
+    write_index(&index, file.c_str());
+    return std::unique_ptr<Index>(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+}
+
+// Nothing truncated is the v1 layout, so it is stamped 1 and builds from before
+// truncation still read it. A truncated file must never be: a v1 reader would
+// score its partial copies as if whole.
+TEST(DiskSeismicIndex, StampsVersionOneUnlessTruncated) {
+    const CSR corpus = make_corpus(600, /*seed=*/7);
+    TempIndexFile whole("nsparse_dsei_stamp_whole.idx");
+    ASSERT_NE(mapped_dsei(corpus, /*limit=*/0, whole), nullptr);
+    EXPECT_EQ(file_format_version(whole.c_str()), 1U);
+    TempIndexFile cut("nsparse_dsei_stamp_cut.idx");
+    ASSERT_NE(mapped_dsei(corpus, /*limit=*/4, cut), nullptr);
+    EXPECT_EQ(file_format_version(cut.c_str()),
+              DiskSeismicIndex::kFormatVersion);
+}
+
+// A format-version-1 file has no max_doc_nnz; the bytes it sits in were
+// padding. A truncated file relabelled v1 puts a limit there: read as v1 it is
+// scored as if whole, so the re-scoring depth has nothing to change.
+TEST(DiskSeismicIndex, ReadsAFormatVersionOneFile) {
+    const CSR corpus = make_corpus(800, /*seed=*/8);
+    const CSR queries = make_corpus(20, /*seed=*/9);
+    TempIndexFile file("nsparse_dsei_v1.idx");
+    DiskSeismicSearchParameters shallow(/*cut=*/10, /*k_prime=*/32,
+                                        /*rescore=*/10);
+    DiskSeismicSearchParameters deep(/*cut=*/10, /*k_prime=*/32,
+                                     /*rescore=*/INT32_MAX);
+    {
+        // Read as written, the depth does change results, so the check below
+        // can see a v1 reader that honors the limit.
+        std::unique_ptr<Index> v2 = mapped_dsei(corpus, /*limit=*/4, file);
+        ASSERT_NE(v2, nullptr);
+        ASSERT_NE(search_all(*v2, queries, 10, &shallow),
+                  search_all(*v2, queries, 10, &deep));
+    }
+    ASSERT_EQ(file_format_version(file.c_str()),
+              DiskSeismicIndex::kFormatVersion);
+    set_file_format_version(file.c_str(), 1);
+    std::unique_ptr<Index> v1(read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(v1, nullptr);
+    expect_same_results(search_all(*v1, queries, 10, &shallow),
+                        search_all(*v1, queries, 10, &deep));
+}
+
 }  // namespace nsparse

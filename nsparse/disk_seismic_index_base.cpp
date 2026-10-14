@@ -372,7 +372,16 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     doc_locators_ = cursor->read_array<detail::DocLocator>(num_locators);
     num_locators_ = num_locators;
     remainder_.mmap_deserialize(cursor);
-    validate_doc_locators();
+    // Only a truncated index reads the table on every query (its second pass);
+    // otherwise only the <= k exact path does, and resolve_doc checks each
+    // locator it uses. The table is ~12 B per doc, read once front to back, so
+    // let the kernel read ahead instead of faulting it in a page at a time.
+    if (fwd_.max_doc_nnz() > 0) {
+        mapped.read_sequentially(
+            reinterpret_cast<const uint8_t*>(doc_locators_),
+            num_locators_ * sizeof(detail::DocLocator),
+            [this] { validate_doc_locators(); });
+    }
 
     // Now that the summaries and forward index are populated (still borrowing
     // from `mapped`, which is alive here), let the concrete index reject a
