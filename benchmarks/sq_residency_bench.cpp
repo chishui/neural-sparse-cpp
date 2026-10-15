@@ -19,11 +19,15 @@
 //
 //   build  <csr> <descriptor> <out.dat>
 //   search <dat> <queries.csr> <k> <reps> <inmem|mmap> [truth.txt]
+//
+// NSPARSE_TWO_PHASE="<prune_ratio>,<expansion_rate>,<max_window_size>" searches
+// an inverted index two-phase; the seismic knobs are then unused.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -38,6 +42,7 @@
 #include "nsparse/disk_seismic_index.h"
 #include "nsparse/index.h"
 #include "nsparse/index_factory.h"
+#include "nsparse/inverted_index.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
@@ -230,8 +235,24 @@ int do_search(int argc, char** argv) {
               << (vectors == nullptr ? 0 : vectors->get_element_size()) << "\n";
     print_memory("after_load");
 
-    std::unique_ptr<nsparse::SeismicSearchParameters> params;
-    if (k_prime > 0) {
+    std::unique_ptr<nsparse::SearchParameters> params;
+    if (const char* two_phase = std::getenv("NSPARSE_TWO_PHASE");
+        two_phase != nullptr && two_phase[0] != '\0') {
+        float prune_ratio = 0;
+        float expansion_rate = 0;
+        int max_window_size = 0;
+        if (std::sscanf(two_phase, "%f,%f,%d", &prune_ratio, &expansion_rate,
+                        &max_window_size) != 3) {
+            std::cerr << "NSPARSE_TWO_PHASE must be "
+                         "<prune_ratio>,<expansion_rate>,<max_window_size>\n";
+            return 2;
+        }
+        params = std::make_unique<nsparse::InvertedSearchParameters>(
+            prune_ratio, expansion_rate, max_window_size);
+        std::cout << "search_params two_phase prune_ratio " << prune_ratio
+                  << " expansion_rate " << expansion_rate
+                  << " max_window_size " << max_window_size << "\n";
+    } else if (k_prime > 0) {
         params = std::make_unique<nsparse::DiskSeismicSearchParameters>(cut, k_prime);
         std::cout << "search_params cut " << cut << " k_prime " << k_prime << "\n";
     } else {
@@ -259,6 +280,11 @@ int do_search(int argc, char** argv) {
         std::cout << "batch_ms " << ms << " qps "
                   << (static_cast<double>(n_queries) * 1000.0 / ms) << "\n";
     }
+    // From the last timed batch: the per-query calls below overwrite `labels`.
+    if (!truth_path.empty()) {
+        std::cout << "recall@" << k << " "
+                  << recall_at_k(truth_path, labels, k, n_queries) << "\n";
+    }
 
     // Per-query calls for the tail. Slightly pessimistic in absolute terms --
     // each call re-allocates the dense scratch the batched path amortizes --
@@ -285,14 +311,6 @@ int do_search(int argc, char** argv) {
               << percentile(per_query_ms, 0.90) << " p99 "
               << percentile(per_query_ms, 0.99) << "\n";
 
-    // Recall from a final batched pass, so `labels` holds every query again.
-    index->search(static_cast<nsparse::idx_t>(n_queries), query.indptr.data(),
-                  query.indices.data(), query.data.data(), k, distances.data(),
-                  labels.data(), params.get());
-    if (!truth_path.empty()) {
-        std::cout << "recall@" << k << " "
-                  << recall_at_k(truth_path, labels, k, n_queries) << "\n";
-    }
     print_memory("after_search");
     return 0;
 }

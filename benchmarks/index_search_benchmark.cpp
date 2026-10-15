@@ -19,6 +19,7 @@
 
 #include "nsparse/index.h"
 #include "nsparse/index_factory.h"
+#include "nsparse/inverted_index.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
@@ -157,7 +158,8 @@ struct IndexFixture {
 // ---------------------------------------------------------------------------
 // Inverted Index
 // ---------------------------------------------------------------------------
-static void BM_InvertedIndex_Search(benchmark::State& state) {
+static void run_inverted_search(benchmark::State& state,
+                                nsparse::SearchParameters* params) {
     auto& fix = IndexFixture::get("inverted", "");
     const int k = static_cast<int>(state.range(0));
     const int n_queries = static_cast<int>(fix.query.nrow);
@@ -169,7 +171,7 @@ static void BM_InvertedIndex_Search(benchmark::State& state) {
         fix.index->search(static_cast<nsparse::idx_t>(n_queries),
                           fix.query.indptr.data(), fix.query.indices.data(),
                           fix.query.data.data(), k, distances.data(),
-                          labels.data(), nullptr);
+                          labels.data(), params);
         benchmark::DoNotOptimize(distances.data());
         benchmark::DoNotOptimize(labels.data());
     }
@@ -182,11 +184,29 @@ static void BM_InvertedIndex_Search(benchmark::State& state) {
                            benchmark::Counter::kIsIterationInvariantRate);
 }
 
+static void BM_InvertedIndex_Search(benchmark::State& state) {
+    run_inverted_search(state, nullptr);
+}
+
+// OpenSearch's two-phase defaults: prune_ratio 0.4, expansion_rate 5.
+static void BM_InvertedIndex_TwoPhase_Search(benchmark::State& state) {
+    nsparse::InvertedSearchParameters params;
+    run_inverted_search(state, &params);
+}
+
 BENCHMARK(BM_InvertedIndex_Search)
     ->Arg(10)
     ->Unit(benchmark::kMillisecond)
     ->Repetitions(10);
 BENCHMARK(BM_InvertedIndex_Search)
+    ->Arg(100)
+    ->Unit(benchmark::kMillisecond)
+    ->Repetitions(10);
+BENCHMARK(BM_InvertedIndex_TwoPhase_Search)
+    ->Arg(10)
+    ->Unit(benchmark::kMillisecond)
+    ->Repetitions(10);
+BENCHMARK(BM_InvertedIndex_TwoPhase_Search)
     ->Arg(100)
     ->Unit(benchmark::kMillisecond)
     ->Repetitions(10);
