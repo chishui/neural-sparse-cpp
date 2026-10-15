@@ -15,8 +15,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -720,6 +722,187 @@ TEST(InvertedIndexSearch, search_ignores_query_terms_beyond_the_dimension) {
     EXPECT_EQ(labels[1], 1);
     EXPECT_FLOAT_EQ(distances[0], 1.0F);
     EXPECT_FLOAT_EQ(distances[1], 0.5F);
+}
+
+// ============== two-phase search tests ==============
+
+namespace {
+
+struct QueryResult {
+    std::vector<idx_t> labels;
+    std::vector<float> distances;
+};
+
+QueryResult search_one(Index& index, const std::map<int, float>& query, int k,
+                       SearchParameters* params) {
+    std::vector<offset_t> indptr = {0, static_cast<offset_t>(query.size())};
+    std::vector<term_t> indices;
+    std::vector<float> values;
+    for (const auto& [term, value] : query) {
+        indices.push_back(static_cast<term_t>(term));
+        values.push_back(value);
+    }
+    QueryResult result{std::vector<idx_t>(k), std::vector<float>(k)};
+    index.search(1, indptr.data(), indices.data(), values.data(), k,
+                 result.distances.data(), result.labels.data(), params);
+    return result;
+}
+
+// With prune_ratio 0.4, term 0 (weight 1.0) leads the first pass and term 1
+// (0.3 < 0.4) only rescores. By the first pass alone doc0 (1.0) beats doc1
+// (0.9); rescored, doc1 (0.9 + 0.3) wins. doc2 is the true best (1.5), but only
+// the low-weight term matches it.
+const std::map<int, float> kTwoPhaseQuery = {{0, 1.0F}, {1, 0.3F}};
+
+void add_two_phase_docs(InvertedIndex& index) {
+    add_docs(index, {{{0, 1.0F}}, {{0, 0.9F}, {1, 1.0F}}, {{1, 5.0F}}});
+    index.build();
+}
+
+}  // namespace
+
+TEST(InvertedIndexTwoPhase, rescores_first_pass_candidates_with_full_query) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    InvertedSearchParameters params(0.4F, 2.0F, 100);
+    auto result = search_one(index, kTwoPhaseQuery, 1, &params);
+
+    EXPECT_EQ(result.labels[0], 1);
+    EXPECT_FLOAT_EQ(result.distances[0], 1.2F);
+}
+
+TEST(InvertedIndexTwoPhase, misses_docs_only_low_weight_terms_match) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    InvertedSearchParameters params(0.4F, 5.0F, 100);
+    auto result = search_one(index, kTwoPhaseQuery, 3, &params);
+
+    EXPECT_EQ(result.labels, (std::vector<idx_t>{1, 0, -1}));
+    EXPECT_FLOAT_EQ(result.distances[0], 1.2F);
+    EXPECT_FLOAT_EQ(result.distances[1], 1.0F);
+    EXPECT_FLOAT_EQ(result.distances[2], -1.0F);
+
+    auto exact = search_one(index, kTwoPhaseQuery, 3, nullptr);
+    EXPECT_EQ(exact.labels, (std::vector<idx_t>{2, 1, 0}));
+}
+
+TEST(InvertedIndexTwoPhase, expansion_rate_sizes_the_candidate_window) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    // A window of k = 1 holds only doc0, the first pass's best.
+    InvertedSearchParameters params(0.4F, 1.0F, 100);
+    auto result = search_one(index, kTwoPhaseQuery, 1, &params);
+
+    EXPECT_EQ(result.labels[0], 0);
+    EXPECT_FLOAT_EQ(result.distances[0], 1.0F);
+}
+
+TEST(InvertedIndexTwoPhase, max_window_size_caps_the_candidate_window) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    InvertedSearchParameters params(0.4F, 2.0F, 1);
+    auto result = search_one(index, kTwoPhaseQuery, 1, &params);
+
+    EXPECT_EQ(result.labels[0], 0);
+}
+
+TEST(InvertedIndexTwoPhase, max_window_size_never_shrinks_the_window_below_k) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    InvertedSearchParameters params(0.4F, 5.0F, 1);
+    auto result = search_one(index, kTwoPhaseQuery, 2, &params);
+
+    EXPECT_EQ(result.labels, (std::vector<idx_t>{1, 0}));
+}
+
+TEST(InvertedIndexTwoPhase, zero_prune_ratio_is_the_exact_search) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    InvertedSearchParameters params(0.0F, 1.0F, 100);
+    auto result = search_one(index, kTwoPhaseQuery, 3, &params);
+    auto exact = search_one(index, kTwoPhaseQuery, 3, nullptr);
+
+    EXPECT_EQ(result.labels, exact.labels);
+    EXPECT_EQ(result.distances, exact.distances);
+}
+
+TEST(InvertedIndexTwoPhase, first_pass_honours_the_id_selector) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    // doc1 would win after rescoring, but it is filtered out.
+    std::vector<idx_t> allowed_ids = {0, 2};
+    SetIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    InvertedSearchParameters params(0.4F, 5.0F, 100);
+    params.set_id_selector(&selector);
+    auto result = search_one(index, kTwoPhaseQuery, 2, &params);
+
+    EXPECT_EQ(result.labels, (std::vector<idx_t>{0, -1}));
+}
+
+// Rescoring walks each low-weight posting list forward over candidates spread
+// across several 4096-doc scoring windows.
+TEST(InvertedIndexTwoPhase, rescores_candidates_across_scoring_windows) {
+    constexpr int kNumDocs = 10000;
+    InvertedIndex index(3);
+    std::vector<std::map<int, float>> docs(kNumDocs);
+    for (int i = 0; i < kNumDocs; ++i) {
+        docs[i][0] = 1.0F;
+        if (i % 1000 == 999) {
+            docs[i][1] = static_cast<float>(i) / kNumDocs;
+        }
+        if (i % 2 == 0) {
+            docs[i][2] = 0.01F;
+        }
+    }
+    add_docs(index, docs);
+    index.build();
+
+    // Term 0 ties every doc, so the window is the first pass's whole corpus;
+    // the low-weight terms 1 and 2 decide the order.
+    InvertedSearchParameters params(0.5F, 1.0F, kNumDocs);
+    const std::map<int, float> query = {{0, 1.0F}, {1, 0.1F}, {2, 0.1F}};
+    auto result = search_one(index, query, kNumDocs, &params);
+    auto exact = search_one(index, query, kNumDocs, nullptr);
+
+    ASSERT_EQ(result.labels.size(), exact.labels.size());
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(result.labels[i], exact.labels[i]) << "rank " << i;
+        EXPECT_NEAR(result.distances[i], exact.distances[i], 1e-6F);
+    }
+    EXPECT_EQ(result.labels[0], 9999);
+}
+
+TEST(InvertedIndexTwoPhase, plain_search_parameters_stay_exact) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    SearchParameters params;
+    auto result = search_one(index, kTwoPhaseQuery, 1, &params);
+
+    EXPECT_EQ(result.labels[0], 2);
+}
+
+TEST(InvertedIndexTwoPhase, rejects_out_of_range_parameters) {
+    InvertedIndex index(2);
+    add_two_phase_docs(index);
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    for (auto params : {InvertedSearchParameters(-0.1F, 5.0F, 100),
+                        InvertedSearchParameters(1.1F, 5.0F, 100),
+                        InvertedSearchParameters(nan, 5.0F, 100),
+                        InvertedSearchParameters(0.4F, 0.5F, 100),
+                        InvertedSearchParameters(0.4F, nan, 100),
+                        InvertedSearchParameters(0.4F, 5.0F, 0)}) {
+        EXPECT_THROW(search_one(index, kTwoPhaseQuery, 1, &params),
+                     std::invalid_argument);
+    }
 }
 
 // ============== mapped (mmap) read tests ==============

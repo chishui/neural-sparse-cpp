@@ -167,3 +167,59 @@ def test_batch_matches_single_query(index, queries):
     single_d, single_l = search_each(index, queries)
     np.testing.assert_array_equal(batch_l, single_l)
     np.testing.assert_array_equal(batch_d, single_d)
+
+
+def test_two_phase_with_zero_prune_ratio_is_exact(index, queries, oracle):
+    """prune_ratio 0 keeps every term in the first pass, so nothing is lost."""
+    params = nsparse.InvertedSearchParameters(0.0, 1.0, 100)
+    dists, labels = search(index, queries, params=params)
+    want_labels, want_dists = oracle
+    assert_exact(labels, dists, want_labels, want_dists)
+
+
+def test_two_phase_returns_full_query_scores(index, corpus, queries, oracle):
+    """Rescoring restores each returned doc's full dot product, and the
+    defaults (OpenSearch's) lose little against the exact ranking."""
+    from oracle import densify, recall_at_k
+
+    params = nsparse.InvertedSearchParameters()
+    assert params.prune_ratio == pytest.approx(0.4)
+    assert params.expansion_rate == pytest.approx(5.0)
+    assert params.max_window_size == 10000
+    dists, labels = search(index, queries, params=params)
+
+    scores = densify(queries.csr, corpus.dim) @ densify(corpus.csr, corpus.dim).T
+    hit = labels >= 0
+    want = np.take_along_axis(scores, np.where(hit, labels, 0), axis=1)
+    np.testing.assert_allclose(dists[hit], want[hit], rtol=1e-5, atol=1e-5)
+
+    want_labels, _ = oracle
+    assert recall_at_k(labels, want_labels) > 0.9
+
+
+def test_two_phase_through_id_map(corpus, queries, doc_ids):
+    """idmap forwards the subclass, and maps the two-phase results' ids."""
+    params = nsparse.InvertedSearchParameters()
+    plain = make_index(SPEC, corpus)
+    want_d, want_l = search(plain, queries, params=params)
+
+    mapped = make_index(f"idmap,{SPEC}", corpus, ids=doc_ids)
+    dists, labels = search(mapped, queries, params=params)
+    np.testing.assert_array_equal(
+        labels, np.where(want_l >= 0, doc_ids[want_l], PAD_LABEL)
+    )
+    np.testing.assert_array_equal(dists, want_d)
+
+
+@pytest.mark.parametrize(
+    "prune_ratio, expansion_rate, max_window_size",
+    [(-0.1, 5.0, 100), (1.5, 5.0, 100), (0.4, 0.5, 100), (0.4, 5.0, 0)],
+)
+def test_two_phase_rejects_out_of_range_parameters(
+    index, queries, prune_ratio, expansion_rate, max_window_size
+):
+    params = nsparse.InvertedSearchParameters(
+        prune_ratio, expansion_rate, max_window_size
+    )
+    with pytest.raises(ValueError):
+        search(index, queries, params=params)

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -241,6 +242,114 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
     }
 }
 
+// Block-max WAND over the given terms: leaves the best heap-capacity docs in
+// `heap`.
+void collect_top_docs(const term_t* indices, const float* values, int size,
+                      const ArrayInvertedLists& inverted_lists,
+                      const Buf<float>& max_term_scores,
+                      const IDSelector* id_selector,
+                      detail::TopKHolder<idx_t>& heap) {
+    // Stack-local scorers — small and hot in L1 cache.
+    std::vector<DirectTermScorer> scorers(size);
+    std::vector<float> max_score_prefix(size + 1, 0.0F);
+
+    // Thread-local window buffer — 16KB, reused across queries.
+    thread_local std::vector<float> window_scores(kScoreWindowSize, 0.0F);
+
+    build_scorers(indices, values, size, inverted_lists, max_term_scores,
+                  scorers, max_score_prefix);
+
+    int first_essential = 0;
+
+    // Bitmap to track which window slots have non-zero scores.
+    // 4096 bits = 64 uint64_t words = 512 bytes (8 cache lines).
+    static constexpr int kBitmapWords = kScoreWindowSize / 64;
+    thread_local uint64_t bitmap[kBitmapWords];
+
+    while (true) {
+        // Re-partition based on current heap threshold.
+        if (heap.full()) {
+            float threshold = heap.peek_score();
+            first_essential = 0;
+            for (int i = 0; i < size; ++i) {
+                if (max_score_prefix[i + 1] < threshold) {
+                    first_essential = i + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Find the minimum doc_id among essential scorers.
+        idx_t min_doc_id = kNoMoreDocs;
+        for (int i = first_essential; i < size; ++i) {
+            idx_t doc = scorers[i].doc_id();
+            if (doc < min_doc_id) {
+                min_doc_id = doc;
+            }
+        }
+        if (min_doc_id == kNoMoreDocs) {
+            break;
+        }
+
+        // Define the scoring window.
+        int window_base = (min_doc_id / kScoreWindowSize) * kScoreWindowSize;
+        int window_end = window_base + kScoreWindowSize;
+
+        std::memset(bitmap, 0, sizeof(bitmap));
+        score_essential_terms(scorers, first_essential, window_base, window_end,
+                              window_scores, bitmap);
+        evaluate_window_candidates(scorers, first_essential, window_base,
+                                   max_score_prefix, window_scores, bitmap,
+                                   id_selector, heap);
+    }
+}
+
+// Adds the given terms' contributions to each candidate's score. `items` must
+// be in ascending id order, so every posting list is walked forward once.
+void rescore_docs(const term_t* indices, const float* values, int size,
+                  const ArrayInvertedLists& inverted_lists,
+                  const Buf<float>& max_term_scores,
+                  std::vector<detail::TopKItem<idx_t>>& items) {
+    std::vector<DirectTermScorer> scorers(size);
+    std::vector<float> max_score_prefix(size + 1, 0.0F);
+    build_scorers(indices, values, size, inverted_lists, max_term_scores,
+                  scorers, max_score_prefix);
+    for (auto& scorer : scorers) {
+        for (auto& item : items) {
+            const idx_t doc = scorer.advance_to(item.id);
+            if (doc == kNoMoreDocs) {
+                break;
+            }
+            if (doc == item.id) {
+                item.score += scorer.query_weight * scorer.value();
+            }
+        }
+    }
+}
+
+// How many first-pass candidates the two-phase search rescores.
+int two_phase_window(int k, const InvertedSearchParameters& parameters) {
+    const double expanded =
+        std::ceil(static_cast<double>(k) * parameters.expansion_rate);
+    const double capped =
+        std::min(expanded, static_cast<double>(parameters.max_window_size));
+    return std::max(k, static_cast<int>(capped));
+}
+
+void throw_if_invalid(const InvertedSearchParameters& parameters) {
+    // Negated comparisons, so NaN is rejected too.
+    if (!(parameters.prune_ratio >= 0.0F && parameters.prune_ratio <= 1.0F)) {
+        throw std::invalid_argument("prune_ratio must be in [0, 1]");
+    }
+    if (!(parameters.expansion_rate >= 1.0F)) {
+        throw std::invalid_argument("expansion_rate must be at least 1");
+    }
+    if (parameters.max_window_size <= 0) {
+        throw std::invalid_argument("max_window_size must be positive");
+    }
+}
+
 }  // namespace
 
 InvertedIndex::InvertedIndex(int dim) : MmapIndex(dim) {}
@@ -298,6 +407,11 @@ auto InvertedIndex::search(idx_t n, const offset_t* indptr,
                            const term_t* indices, const float* values, int k,
                            SearchParameters* search_parameters)
     -> pair_of_score_id_vectors_t {
+    const auto* two_phase =
+        dynamic_cast<const InvertedSearchParameters*>(search_parameters);
+    if (two_phase != nullptr) {
+        throw_if_invalid(*two_phase);
+    }
     if (inverted_lists_ == nullptr || n == 0) {
         return {std::vector<std::vector<float>>(n),
                 std::vector<std::vector<idx_t>>(n)};
@@ -320,14 +434,21 @@ auto InvertedIndex::search(idx_t n, const offset_t* indptr,
     const IDSelector* id_selector = search_parameters == nullptr
                                         ? nullptr
                                         : search_parameters->get_id_selector();
+    float prune_ratio = 0.0F;
+    int window = k;
+    if (two_phase != nullptr) {
+        prune_ratio = two_phase->prune_ratio;
+        window = two_phase_window(k, *two_phase);
+    }
 
 #pragma omp parallel for
     for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
         const offset_t start = query_indptr[query_idx];
         const size_t len = query_indptr[query_idx + 1] - start;
 
-        auto [distances, labels] = single_query(
-            query_indices + start, query_values + start, len, k, id_selector);
+        auto [distances, labels] =
+            single_query(query_indices + start, query_values + start, len, k,
+                         id_selector, prune_ratio, window);
         result_distances[query_idx] = std::move(distances);
         result_labels[query_idx] = std::move(labels);
     }
@@ -336,7 +457,8 @@ auto InvertedIndex::search(idx_t n, const offset_t* indptr,
 }
 
 auto InvertedIndex::single_query(const term_t* indices, const float* values,
-                                 int size, int k, const IDSelector* id_selector)
+                                 int size, int k, const IDSelector* id_selector,
+                                 float prune_ratio, int window)
     -> pair_of_score_id_vector_t {
     if (size == 0) {
         std::vector<float> scores(k, -1.0F);
@@ -344,61 +466,51 @@ auto InvertedIndex::single_query(const term_t* indices, const float* values,
         return {scores, ids};
     }
 
+    std::vector<term_t> high_indices;
+    std::vector<float> high_values;
+    std::vector<term_t> low_indices;
+    std::vector<float> low_values;
+    if (prune_ratio > 0.0F) {
+        const float cutoff =
+            prune_ratio * *std::max_element(values, values + size);
+        for (int i = 0; i < size; ++i) {
+            if (values[i] >= cutoff) {
+                high_indices.push_back(indices[i]);
+                high_values.push_back(values[i]);
+            } else {
+                low_indices.push_back(indices[i]);
+                low_values.push_back(values[i]);
+            }
+        }
+    }
+
     detail::TopKHolder<idx_t> heap(k);
-
-    // Stack-local scorers — small and hot in L1 cache.
-    std::vector<DirectTermScorer> scorers(size);
-    std::vector<float> max_score_prefix(size + 1, 0.0F);
-
-    // Thread-local window buffer — 16KB, reused across queries.
-    thread_local std::vector<float> window_scores(kScoreWindowSize, 0.0F);
-
-    build_scorers(indices, values, size, *inverted_lists_, max_term_scores_,
-                  scorers, max_score_prefix);
-
-    int first_essential = 0;
-
-    // Bitmap to track which window slots have non-zero scores.
-    // 4096 bits = 64 uint64_t words = 512 bytes (8 cache lines).
-    static constexpr int kBitmapWords = kScoreWindowSize / 64;
-    thread_local uint64_t bitmap[kBitmapWords];
-
-    while (true) {
-        // Re-partition based on current heap threshold.
-        if (heap.full()) {
-            float threshold = heap.peek_score();
-            first_essential = 0;
-            for (int i = 0; i < size; ++i) {
-                if (max_score_prefix[i + 1] < threshold) {
-                    first_essential = i + 1;
-                } else {
-                    break;
-                }
-            }
+    // Nothing to split off (or, with no positive weight, nothing left to lead
+    // the first pass): the plain search is already exact.
+    if (low_indices.empty() || high_indices.empty()) {
+        collect_top_docs(indices, values, size, *inverted_lists_,
+                         max_term_scores_, id_selector, heap);
+    } else {
+        detail::TopKHolder<idx_t> candidates(window);
+        collect_top_docs(high_indices.data(), high_values.data(),
+                         static_cast<int>(high_indices.size()),
+                         *inverted_lists_, max_term_scores_, id_selector,
+                         candidates);
+        auto [scores, docs] = candidates.top_k_items_descending();
+        std::vector<detail::TopKItem<idx_t>> items(docs.size());
+        for (size_t i = 0; i < docs.size(); ++i) {
+            items[i] = {scores[i], docs[i]};
         }
+        std::sort(
+            items.begin(), items.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.id < rhs.id; });
 
-        // Find the minimum doc_id among essential scorers.
-        idx_t min_doc_id = kNoMoreDocs;
-        for (int i = first_essential; i < size; ++i) {
-            idx_t doc = scorers[i].doc_id();
-            if (doc < min_doc_id) {
-                min_doc_id = doc;
-            }
+        rescore_docs(low_indices.data(), low_values.data(),
+                     static_cast<int>(low_indices.size()), *inverted_lists_,
+                     max_term_scores_, items);
+        for (const auto& item : items) {
+            heap.add(item.score, item.id);
         }
-        if (min_doc_id == kNoMoreDocs) {
-            break;
-        }
-
-        // Define the scoring window.
-        int window_base = (min_doc_id / kScoreWindowSize) * kScoreWindowSize;
-        int window_end = window_base + kScoreWindowSize;
-
-        std::memset(bitmap, 0, sizeof(bitmap));
-        score_essential_terms(scorers, first_essential, window_base, window_end,
-                              window_scores, bitmap);
-        evaluate_window_candidates(scorers, first_essential, window_base,
-                                   max_score_prefix, window_scores, bitmap,
-                                   id_selector, heap);
     }
 
     auto [result_scores, ids] = heap.top_k_items_descending();

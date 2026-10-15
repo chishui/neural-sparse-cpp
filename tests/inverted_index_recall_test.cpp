@@ -262,5 +262,75 @@ INSTANTIATE_TEST_SUITE_P(
         // Very sparse queries and docs.
         std::make_tuple(10000, 5000, 5, 10)));
 
+// With a window covering the whole corpus, the only loss two-phase search
+// takes is by design: a document no high-weight term matches never becomes a
+// candidate. Every other document must come back with its full-query score.
+class InvertedIndexTwoPhaseTest
+    : public ::testing::TestWithParam<std::tuple<int, int, int, int>> {};
+
+TEST_P(InvertedIndexTwoPhaseTest, matches_exact_search_over_first_pass_docs) {
+    auto [n_docs, dim, avg_nnz, k] = GetParam();
+    constexpr int kQueries = 50;
+    constexpr float kPruneRatio = 0.4F;
+
+    auto data = generate_random_data(dim, n_docs, kQueries, avg_nnz);
+    InvertedIndex index(dim);
+    add_docs_from_data(index, data.docs);
+    index.build();
+    Index* idx = &index;
+
+    InvertedSearchParameters params(kPruneRatio, static_cast<float>(n_docs),
+                                    n_docs);
+    int n_split = 0;
+    for (const auto& query : data.queries) {
+        if (query.empty()) continue;
+
+        float max_weight = 0.0F;
+        for (const auto& [t, v] : query) max_weight = std::max(max_weight, v);
+        std::set<term_t> high_terms;
+        for (const auto& [t, v] : query) {
+            if (v >= kPruneRatio * max_weight) high_terms.insert(t);
+        }
+        n_split += high_terms.size() < query.size() ? 1 : 0;
+
+        // Ground truth over the docs some high-weight term matches.
+        std::vector<std::vector<std::pair<term_t, float>>> candidates(
+            data.docs.size());
+        for (size_t d = 0; d < data.docs.size(); ++d) {
+            for (const auto& [t, v] : data.docs[d]) {
+                if (high_terms.count(t) != 0) {
+                    candidates[d] = data.docs[d];
+                    break;
+                }
+            }
+        }
+        auto gt = brute_force_top_k(candidates, query, k);
+
+        std::vector<offset_t> q_indptr = {0,
+                                          static_cast<offset_t>(query.size())};
+        std::vector<term_t> q_indices;
+        std::vector<float> q_values;
+        for (const auto& [t, v] : query) {
+            q_indices.push_back(t);
+            q_values.push_back(v);
+        }
+        std::vector<idx_t> labels(k, detail::INVALID_IDX);
+        std::vector<float> distances(k, -1.0F);
+        idx->search(1, q_indptr.data(), q_indices.data(), q_values.data(), k,
+                    distances.data(), labels.data(), &params);
+
+        EXPECT_FLOAT_EQ(compute_recall(labels, gt), 1.0F);
+    }
+    // Guards against a generator change leaving nothing to rescore.
+    EXPECT_GT(n_split, kQueries / 2);
+}
+
+INSTANTIATE_TEST_SUITE_P(TwoPhaseTests, InvertedIndexTwoPhaseTest,
+                         ::testing::Values(
+                             // (n_docs, dim, avg_nnz, k)
+                             std::make_tuple(2000, 500, 20, 10),
+                             // Candidates spread over several scoring windows.
+                             std::make_tuple(10000, 2000, 30, 50)));
+
 }  // namespace
 }  // namespace nsparse

@@ -24,6 +24,25 @@
 
 namespace nsparse {
 
+// Two-phase search, after OpenSearch's neural_sparse_two_phase_processor with
+// prune_type max_ratio. Query terms weighing less than prune_ratio times the
+// query's largest weight sit out a first pass that collects the top
+// k * expansion_rate documents (capped at max_window_size, never below k), and
+// then rescore only those candidates. Lossy: a document only the low-weight
+// terms match never becomes a candidate. prune_ratio 0 keeps every term in the
+// first pass, which is the exact search.
+struct InvertedSearchParameters : public SearchParameters {
+    float prune_ratio = 0.4F;     // [0, 1]
+    float expansion_rate = 5.0F;  // >= 1
+    int max_window_size = 10000;  // > 0
+    InvertedSearchParameters(float prune_ratio, float expansion_rate,
+                             int max_window_size)
+        : prune_ratio(prune_ratio),
+          expansion_rate(expansion_rate),
+          max_window_size(max_window_size) {}
+    InvertedSearchParameters() = default;
+};
+
 class InvertedIndex : public MmapIndex, public IndexIO {
 public:
     explicit InvertedIndex(int dim);
@@ -78,9 +97,11 @@ private:
                     int io_flags) override;
 
     // `id_selector` may be null; when set, only member docs are returned.
+    // A positive `prune_ratio` runs the two-phase search (see
+    // InvertedSearchParameters), with `window` candidates from the first pass.
     auto single_query(const term_t* indices, const float* values, int size,
-                      int k, const IDSelector* id_selector)
-        -> pair_of_score_id_vector_t;
+                      int k, const IDSelector* id_selector, float prune_ratio,
+                      int window) -> pair_of_score_id_vector_t;
     std::unique_ptr<ArrayInvertedLists> inverted_lists_;
     // Tracked separately, since build() releases the vectors the base holds,
     // and serialised explicitly, since the posting lists hold no entry for a
